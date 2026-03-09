@@ -170,6 +170,11 @@ function select_from_menu {
 
     $selectedIndex = 0
 
+    # Flush any buffered keypresses so stale input doesn't auto-select an option
+    while ([Console]::KeyAvailable) {
+        [void][Console]::ReadKey($true)
+    }
+
     while ($true) {
         Clear-Host
         Show-Banner

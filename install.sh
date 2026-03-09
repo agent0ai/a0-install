@@ -167,6 +167,9 @@ select_from_menu() {
     ITEM_COUNT=$#
     SELECTED_INDEX=0
 
+    # Flush any buffered stdin so stale keypresses don't auto-select an option
+    while IFS= read -rsn1 -t 0.1 _junk </dev/tty 2>/dev/null; do :; done
+
     while :; do
         # Clear screen
         clear >/dev/tty 2>&1
