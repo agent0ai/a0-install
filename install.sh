@@ -212,13 +212,8 @@ select_from_menu() {
         if [ "$key" = $'\x1b' ]; then
             # Read next character with timeout to distinguish bare Escape from arrow keys.
             # Arrow key sequences (\x1b[A) arrive instantly; bare Escape has no follow-up.
-            # Note: -t only supports integer seconds in /bin/sh, so we use -t 1.
-            IFS= read -rsn1 -t 1 key2 </dev/tty 2>/dev/null || true
-            if [ -z "$key2" ]; then
-                # Bare Escape pressed (no follow-up char within timeout) — go back
-                printf "%s\n" "-1"
-                return 1
-            elif [ "$key2" = "[" ]; then
+            IFS= read -rsn1 -t 1 key2 </dev/tty 2>/dev/null || key2=""
+            if [ "$key2" = "[" ]; then
                 # Read arrow key identifier
                 IFS= read -rsn1 key3 </dev/tty
                 case "$key3" in
@@ -235,6 +230,10 @@ select_from_menu() {
                         fi
                         ;;
                 esac
+            else
+                # Bare Escape (timeout or unknown sequence) — go back
+                printf "%s\n" "-1"
+                return 1
             fi
         fi
     done
@@ -320,13 +319,6 @@ check_docker() {
             sudo usermod -aG docker "$USER"
             print_warn "You may need to log out and back in for group changes to take effect."
         fi
-    fi
-
-    if docker compose version > /dev/null 2>&1; then
-        print_ok "Docker Compose available"
-    else
-        print_error "Docker Compose plugin not found. Please install Docker Compose."
-        exit 1
     fi
 
     # -----------------------------------------------------------
@@ -685,11 +677,23 @@ create_instance() {
     # -----------------------------------------------------------
     # 4. Pull image & start container
     # -----------------------------------------------------------
+    local IMAGE="agent0ai/agent-zero:$SELECTED_TAG"
+
     print_info "Pulling Agent Zero image (this may take a moment)..."
-    docker compose -f "$COMPOSE_FILE" pull --quiet
+    docker pull --quiet "$IMAGE"
 
     print_info "Starting Agent Zero..."
-    docker compose -f "$COMPOSE_FILE" up -d
+    local DOCKER_RUN_ARGS=(
+        --name "$CONTAINER_NAME"
+        --restart unless-stopped
+        -p "${PORT}:80"
+        -v "${DATA_DIR}:/a0/usr"
+        -d
+    )
+    if [ -n "$AUTH_LOGIN" ]; then
+        DOCKER_RUN_ARGS+=(-e "AUTH_LOGIN=${AUTH_LOGIN}" -e "AUTH_PASSWORD=${AUTH_PASSWORD}")
+    fi
+    docker run "${DOCKER_RUN_ARGS[@]}" "$IMAGE"
 
     # -----------------------------------------------------------
     # 5. Wait for the service to become ready
@@ -758,11 +762,8 @@ manage_instances() {
 
             # Handle escape sequences (arrow keys) and bare Escape (go back)
             if [ "$key" = $'\x1b' ]; then
-                IFS= read -rsn1 -t 1 key2 </dev/tty 2>/dev/null || true
-                if [ -z "$key2" ]; then
-                    # Bare Escape pressed — go back to main menu
-                    return 0
-                elif [ "$key2" = "[" ]; then
+                IFS= read -rsn1 -t 1 key2 </dev/tty 2>/dev/null || key2=""
+                if [ "$key2" = "[" ]; then
                     IFS= read -rsn1 key3 </dev/tty
                     case "$key3" in
                         A) # Up arrow
@@ -778,6 +779,9 @@ manage_instances() {
                             fi
                             ;;
                     esac
+                else
+                    # Bare Escape pressed — go back to main menu
+                    return 0
                 fi
             fi
         done

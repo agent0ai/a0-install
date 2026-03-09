@@ -306,15 +306,6 @@ function check_docker {
         print_ok "Docker already installed"
     }
 
-    & docker compose version *> $null
-    if ($LASTEXITCODE -eq 0) {
-        print_ok "Docker Compose available"
-    }
-    else {
-        print_error "Docker Compose plugin not found. Please install Docker Compose."
-        exit 1
-    }
-
     if (-not (check_docker_daemon_running)) {
         print_warn "Docker daemon is not running"
         if (start_docker_daemon) {
@@ -738,14 +729,29 @@ function create_instance {
 
     print_info "Created $composeFile"
 
+    $image = "agent0ai/agent-zero:$($script:SelectedTag)"
+
     print_info 'Pulling Agent Zero image (this may take a moment)...'
-    & docker compose -f $composeFile pull --quiet
+    & docker pull --quiet $image
     if ($LASTEXITCODE -ne 0) {
         throw 'Failed to pull Docker image.'
     }
 
     print_info 'Starting Agent Zero...'
-    & docker compose -f $composeFile up -d
+    $dataDirDocker = Convert-ToComposePath -PathValue $dataDir
+    $runArgs = @(
+        'run'
+        '--name', $containerName
+        '--restart', 'unless-stopped'
+        '-p', "${port}:80"
+        '-v', "${dataDirDocker}:/a0/usr"
+        '-d'
+    )
+    if (-not [string]::IsNullOrWhiteSpace($authLogin)) {
+        $runArgs += @('-e', "AUTH_LOGIN=$authLogin", '-e', "AUTH_PASSWORD=$authPassword")
+    }
+    $runArgs += $image
+    & docker @runArgs
     if ($LASTEXITCODE -ne 0) {
         throw 'Failed to start Agent Zero.'
     }
