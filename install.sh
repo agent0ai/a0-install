@@ -537,77 +537,120 @@ select_image_tag() {
 
 create_instance() {
     # -----------------------------------------------------------
-    # 2. Gather configuration from user
+    # 2. Gather configuration from user (step-based wizard)
+    #    Esc on any step goes back to the previous step.
+    #    Esc on the first step aborts create_instance (returns 1).
     # -----------------------------------------------------------
     INSTALL_ROOT="$HOME/.agentzero"
+
+    # Variables populated across wizard steps
+    SELECTED_TAG=""
+    CONTAINER_NAME=""
+    DATA_DIR=""
+    PORT=""
+    AUTH_LOGIN=""
+    AUTH_PASSWORD=""
+
+    # Compute defaults once up front
     DEFAULT_PORT="$(find_free_port 5080)"
     DEFAULT_NAME="$(suggest_next_instance_name "agent-zero")"
 
-    # Tag selection (Escape aborts create_instance)
-    if ! select_image_tag; then
-        return 1
-    fi
+    WIZARD_STEP=1
+    while [ "$WIZARD_STEP" -ge 1 ] && [ "$WIZARD_STEP" -le 6 ]; do
+        case "$WIZARD_STEP" in
+            1)  # Tag / version selection (uses its own full-screen menu)
+                if select_image_tag; then
+                    WIZARD_STEP=2
+                else
+                    return 1  # Esc on first step — abort
+                fi
+                ;;
 
-    # Container / instance name
-    echo ""
-    printf "${BOLD}What should this instance be called?${NC} (Esc to go back)\n"
-    printf "Leave empty to use default [%s]: " "$DEFAULT_NAME"
-    CONTAINER_NAME=$(read_input) || return 1
-    CONTAINER_NAME="${CONTAINER_NAME:-$DEFAULT_NAME}"
+            2)  # Container / instance name
+                clear
+                print_banner
+                echo ""
+                printf "${BOLD}What should this instance be called?${NC} (Esc to go back)\n"
+                printf "Leave empty to use default [%s]: " "$DEFAULT_NAME"
+                CONTAINER_NAME=$(read_input) || { WIZARD_STEP=1; continue; }
+                CONTAINER_NAME="${CONTAINER_NAME:-$DEFAULT_NAME}"
 
-    if instance_name_taken "$CONTAINER_NAME"; then
-        SUGGESTED_NAME="$(suggest_next_instance_name "$CONTAINER_NAME")"
-        print_warn "Instance name '$CONTAINER_NAME' is already taken. Using '$SUGGESTED_NAME'."
-        CONTAINER_NAME="$SUGGESTED_NAME"
-    fi
-    print_info "Instance name: $CONTAINER_NAME"
+                if instance_name_taken "$CONTAINER_NAME"; then
+                    SUGGESTED_NAME="$(suggest_next_instance_name "$CONTAINER_NAME")"
+                    print_warn "Instance name '$CONTAINER_NAME' is already taken. Using '$SUGGESTED_NAME'."
+                    CONTAINER_NAME="$SUGGESTED_NAME"
+                fi
+                print_info "Instance name: $CONTAINER_NAME"
+                WIZARD_STEP=3
+                ;;
 
-    INSTANCE_DIR="$INSTALL_ROOT/$CONTAINER_NAME"
-    DEFAULT_DATA_DIR="$INSTANCE_DIR/usr"
+            3)  # Data directory
+                INSTANCE_DIR="$INSTALL_ROOT/$CONTAINER_NAME"
+                DEFAULT_DATA_DIR="$INSTANCE_DIR/usr"
 
-    # Data directory
-    echo ""
-    printf "${BOLD}Where should Agent Zero store user data?${NC} (Esc to go back)\n"
-    printf "Leave empty to use default [%s]: " "$DEFAULT_DATA_DIR"
-    DATA_DIR=$(read_input) || return 1
-    DATA_DIR="${DATA_DIR:-$DEFAULT_DATA_DIR}"
-    case "$DATA_DIR" in
-        ~/*) DATA_DIR="$HOME/${DATA_DIR#~/}" ;;
-        ~) DATA_DIR="$HOME" ;;
-    esac
-    mkdir -p "$DATA_DIR"
-    print_info "Data directory: $DATA_DIR"
+                clear
+                print_banner
+                echo ""
+                printf "${BOLD}Where should Agent Zero store user data?${NC} (Esc to go back)\n"
+                printf "Leave empty to use default [%s]: " "$DEFAULT_DATA_DIR"
+                DATA_DIR=$(read_input) || { WIZARD_STEP=2; continue; }
+                DATA_DIR="${DATA_DIR:-$DEFAULT_DATA_DIR}"
+                case "$DATA_DIR" in
+                    ~/*) DATA_DIR="$HOME/${DATA_DIR#~/}" ;;
+                    ~) DATA_DIR="$HOME" ;;
+                esac
+                mkdir -p "$DATA_DIR"
+                print_info "Data directory: $DATA_DIR"
+                WIZARD_STEP=4
+                ;;
 
-    # Port
-    echo ""
-    printf "${BOLD}What port should Agent Zero Web UI run on?${NC} (Esc to go back)\n"
-    printf "Leave empty to use default [%s]: " "$DEFAULT_PORT"
-    PORT=$(read_input) || return 1
-    PORT="${PORT:-$DEFAULT_PORT}"
-    case "$PORT" in
-        ''|*[!0-9]*)
-        print_error "Invalid port. Falling back to ${DEFAULT_PORT}."
-        PORT="$DEFAULT_PORT"
-        ;;
-    esac
-    print_info "Web UI port: $PORT"
+            4)  # Port
+                clear
+                print_banner
+                echo ""
+                printf "${BOLD}What port should Agent Zero Web UI run on?${NC} (Esc to go back)\n"
+                printf "Leave empty to use default [%s]: " "$DEFAULT_PORT"
+                PORT=$(read_input) || { WIZARD_STEP=3; continue; }
+                PORT="${PORT:-$DEFAULT_PORT}"
+                case "$PORT" in
+                    ''|*[!0-9]*)
+                    print_error "Invalid port. Falling back to ${DEFAULT_PORT}."
+                    PORT="$DEFAULT_PORT"
+                    ;;
+                esac
+                print_info "Web UI port: $PORT"
+                WIZARD_STEP=5
+                ;;
 
-    # Authentication
-    echo ""
-    printf "${BOLD}What login username should be used for the Web UI?${NC} (Esc to go back)\n"
-    printf "Leave empty for no authentication: "
-    AUTH_LOGIN=$(read_input) || return 1
-    AUTH_PASSWORD=""
-    if [ -n "$AUTH_LOGIN" ]; then
-        echo ""
-        printf "${BOLD}What password should be used?${NC} (Esc to go back)\n"
-        printf "Leave empty to use default [12345678]: "
-        AUTH_PASSWORD=$(read_input) || return 1
-        AUTH_PASSWORD="${AUTH_PASSWORD:-12345678}"
-        print_info "Auth configured for user: $AUTH_LOGIN"
-    else
-        print_warn "No authentication will be configured."
-    fi
+            5)  # Auth username
+                clear
+                print_banner
+                echo ""
+                printf "${BOLD}What login username should be used for the Web UI?${NC} (Esc to go back)\n"
+                printf "Leave empty for no authentication: "
+                AUTH_LOGIN=$(read_input) || { WIZARD_STEP=4; continue; }
+                AUTH_PASSWORD=""
+                if [ -n "$AUTH_LOGIN" ]; then
+                    WIZARD_STEP=6
+                else
+                    print_warn "No authentication will be configured."
+                    WIZARD_STEP=7  # Done gathering input
+                fi
+                ;;
+
+            6)  # Auth password (only reached if username was provided)
+                clear
+                print_banner
+                echo ""
+                printf "${BOLD}What password should be used?${NC} (Esc to go back)\n"
+                printf "Leave empty to use default [12345678]: "
+                AUTH_PASSWORD=$(read_input) || { WIZARD_STEP=5; continue; }
+                AUTH_PASSWORD="${AUTH_PASSWORD:-12345678}"
+                print_info "Auth configured for user: $AUTH_LOGIN"
+                WIZARD_STEP=7  # Done gathering input
+                ;;
+        esac
+    done
 
     echo ""
     print_info "Configuration complete. Setting up Agent Zero..."
@@ -928,6 +971,10 @@ main() {
             exit 0
         fi
         manage_single_instance "$CREATED_CONTAINER_NAME"
+        # After returning from manage (Esc/back), enter the main menu loop.
+        # There is now at least 1 container so the user gets a proper menu
+        # instead of the script silently exiting.
+        main_menu_for_existing
     fi
 }
 
