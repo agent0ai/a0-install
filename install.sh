@@ -649,34 +649,10 @@ create_instance() {
     echo ""
 
     # -----------------------------------------------------------
-    # 3. Generate docker-compose.yml
+    # 3. Pull image & start container
     # -----------------------------------------------------------
     mkdir -p "$INSTANCE_DIR"
 
-    COMPOSE_FILE="$INSTANCE_DIR/docker-compose.yml"
-
-    {
-        echo "services:"
-        echo "  agent-zero:"
-        echo "    image: agent0ai/agent-zero:$SELECTED_TAG"
-        echo "    container_name: $CONTAINER_NAME"
-        echo "    restart: unless-stopped"
-        echo "    ports:"
-        echo "      - \"${PORT}:80\""
-        echo "    volumes:"
-        echo "      - \"${DATA_DIR}:/a0/usr\""
-        if [ -n "$AUTH_LOGIN" ]; then
-            echo "    environment:"
-            echo "      - AUTH_LOGIN=${AUTH_LOGIN}"
-            echo "      - AUTH_PASSWORD=${AUTH_PASSWORD}"
-        fi
-    } > "$COMPOSE_FILE"
-
-    print_info "Created $COMPOSE_FILE"
-
-    # -----------------------------------------------------------
-    # 4. Pull image & start container
-    # -----------------------------------------------------------
     local IMAGE="agent0ai/agent-zero:$SELECTED_TAG"
 
     print_info "Pulling Agent Zero image (this may take a moment)..."
@@ -696,7 +672,7 @@ create_instance() {
     docker run "${DOCKER_RUN_ARGS[@]}" "$IMAGE"
 
     # -----------------------------------------------------------
-    # 5. Wait for the service to become ready
+    # 4. Wait for the service to become ready
     # -----------------------------------------------------------
     wait_for_ready "http://localhost:$PORT"
 

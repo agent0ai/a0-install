@@ -540,42 +540,10 @@ function Expand-UserPath {
     return $PathValue
 }
 
-function Convert-ToComposePath {
+function Convert-ToDockerPath {
     param([string]$PathValue)
 
     return $PathValue -replace '\\', '/'
-}
-
-function New-ComposeFileContent {
-    param(
-        [string]$Tag,
-        [string]$ContainerName,
-        [string]$Port,
-        [string]$DataDir,
-        [string]$AuthLogin,
-        [string]$AuthPassword
-    )
-
-    $dataDirForCompose = Convert-ToComposePath -PathValue $DataDir
-    $lines = New-Object System.Collections.Generic.List[string]
-
-    $lines.Add('services:')
-    $lines.Add('  agent-zero:')
-    $lines.Add("    image: agent0ai/agent-zero:$Tag")
-    $lines.Add("    container_name: $ContainerName")
-    $lines.Add('    restart: unless-stopped')
-    $lines.Add('    ports:')
-    $lines.Add("      - `"${Port}:80`"")
-    $lines.Add('    volumes:')
-    $lines.Add("      - `"${dataDirForCompose}:/a0/usr`"")
-
-    if (-not [string]::IsNullOrWhiteSpace($AuthLogin)) {
-        $lines.Add('    environment:')
-        $lines.Add("      - AUTH_LOGIN=$AuthLogin")
-        $lines.Add("      - AUTH_PASSWORD=$AuthPassword")
-    }
-
-    return $lines.ToArray()
 }
 
 # Returns $true on success, $false if user pressed Escape to go back.
@@ -722,12 +690,6 @@ function create_instance {
 
     $instanceDir = Join-Path $installRoot $containerName
     New-Item -ItemType Directory -Force -Path $instanceDir *> $null
-    $composeFile = Join-Path $instanceDir 'docker-compose.yml'
-
-    $composeLines = New-ComposeFileContent -Tag $script:SelectedTag -ContainerName $containerName -Port $port -DataDir $dataDir -AuthLogin $authLogin -AuthPassword $authPassword
-    Set-Content -Path $composeFile -Value $composeLines -Encoding Ascii
-
-    print_info "Created $composeFile"
 
     $image = "agent0ai/agent-zero:$($script:SelectedTag)"
 
@@ -738,7 +700,7 @@ function create_instance {
     }
 
     print_info 'Starting Agent Zero...'
-    $dataDirDocker = Convert-ToComposePath -PathValue $dataDir
+    $dataDirDocker = Convert-ToDockerPath -PathValue $dataDir
     $runArgs = @(
         'run'
         '--name', $containerName
