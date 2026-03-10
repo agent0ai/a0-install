@@ -167,6 +167,9 @@ select_from_menu() {
     ITEM_COUNT=$#
     SELECTED_INDEX=0
 
+    # Flush any buffered stdin so stale keypresses don't auto-select an option
+    while IFS= read -rsn1 -t 0.1 _junk </dev/tty 2>/dev/null; do :; done
+
     while :; do
         # Clear screen
         clear >/dev/tty 2>&1
@@ -212,13 +215,8 @@ select_from_menu() {
         if [ "$key" = $'\x1b' ]; then
             # Read next character with timeout to distinguish bare Escape from arrow keys.
             # Arrow key sequences (\x1b[A) arrive instantly; bare Escape has no follow-up.
-            # Note: -t only supports integer seconds in /bin/sh, so we use -t 1.
-            IFS= read -rsn1 -t 1 key2 </dev/tty 2>/dev/null || true
-            if [ -z "$key2" ]; then
-                # Bare Escape pressed (no follow-up char within timeout) — go back
-                printf "%s\n" "-1"
-                return 1
-            elif [ "$key2" = "[" ]; then
+            IFS= read -rsn1 -t 1 key2 </dev/tty 2>/dev/null || key2=""
+            if [ "$key2" = "[" ]; then
                 # Read arrow key identifier
                 IFS= read -rsn1 key3 </dev/tty
                 case "$key3" in
@@ -235,6 +233,10 @@ select_from_menu() {
                         fi
                         ;;
                 esac
+            else
+                # Bare Escape (timeout or unknown sequence) — go back
+                printf "%s\n" "-1"
+                return 1
             fi
         fi
     done
@@ -320,13 +322,6 @@ check_docker() {
             sudo usermod -aG docker "$USER"
             print_warn "You may need to log out and back in for group changes to take effect."
         fi
-    fi
-
-    if docker compose version > /dev/null 2>&1; then
-        print_ok "Docker Compose available"
-    else
-        print_error "Docker Compose plugin not found. Please install Docker Compose."
-        exit 1
     fi
 
     # -----------------------------------------------------------
@@ -537,119 +532,150 @@ select_image_tag() {
 
 create_instance() {
     # -----------------------------------------------------------
-    # 2. Gather configuration from user
+    # 2. Gather configuration from user (step-based wizard)
+    #    Esc on any step goes back to the previous step.
+    #    Esc on the first step aborts create_instance (returns 1).
     # -----------------------------------------------------------
     INSTALL_ROOT="$HOME/.agentzero"
+
+    # Variables populated across wizard steps
+    SELECTED_TAG=""
+    CONTAINER_NAME=""
+    DATA_DIR=""
+    PORT=""
+    AUTH_LOGIN=""
+    AUTH_PASSWORD=""
+
+    # Compute defaults once up front
     DEFAULT_PORT="$(find_free_port 5080)"
     DEFAULT_NAME="$(suggest_next_instance_name "agent-zero")"
 
-    # Tag selection (Escape aborts create_instance)
-    if ! select_image_tag; then
-        return 1
-    fi
+    WIZARD_STEP=1
+    while [ "$WIZARD_STEP" -ge 1 ] && [ "$WIZARD_STEP" -le 6 ]; do
+        case "$WIZARD_STEP" in
+            1)  # Tag / version selection (uses its own full-screen menu)
+                if select_image_tag; then
+                    WIZARD_STEP=2
+                else
+                    return 1  # Esc on first step — abort
+                fi
+                ;;
 
-    # Container / instance name
-    echo ""
-    printf "${BOLD}What should this instance be called?${NC} (Esc to go back)\n"
-    printf "Leave empty to use default [%s]: " "$DEFAULT_NAME"
-    CONTAINER_NAME=$(read_input) || return 1
-    CONTAINER_NAME="${CONTAINER_NAME:-$DEFAULT_NAME}"
+            2)  # Container / instance name
+                clear
+                print_banner
+                echo ""
+                printf "${BOLD}What should this instance be called?${NC} (Esc to go back)\n"
+                printf "Leave empty to use default [%s]: " "$DEFAULT_NAME"
+                CONTAINER_NAME=$(read_input) || { WIZARD_STEP=1; continue; }
+                CONTAINER_NAME="${CONTAINER_NAME:-$DEFAULT_NAME}"
 
-    if instance_name_taken "$CONTAINER_NAME"; then
-        SUGGESTED_NAME="$(suggest_next_instance_name "$CONTAINER_NAME")"
-        print_warn "Instance name '$CONTAINER_NAME' is already taken. Using '$SUGGESTED_NAME'."
-        CONTAINER_NAME="$SUGGESTED_NAME"
-    fi
-    print_info "Instance name: $CONTAINER_NAME"
+                if instance_name_taken "$CONTAINER_NAME"; then
+                    SUGGESTED_NAME="$(suggest_next_instance_name "$CONTAINER_NAME")"
+                    print_warn "Instance name '$CONTAINER_NAME' is already taken. Using '$SUGGESTED_NAME'."
+                    CONTAINER_NAME="$SUGGESTED_NAME"
+                fi
+                print_info "Instance name: $CONTAINER_NAME"
+                WIZARD_STEP=3
+                ;;
 
-    INSTANCE_DIR="$INSTALL_ROOT/$CONTAINER_NAME"
-    DEFAULT_DATA_DIR="$INSTANCE_DIR/usr"
+            3)  # Data directory
+                INSTANCE_DIR="$INSTALL_ROOT/$CONTAINER_NAME"
+                DEFAULT_DATA_DIR="$INSTANCE_DIR/usr"
 
-    # Data directory
-    echo ""
-    printf "${BOLD}Where should Agent Zero store user data?${NC} (Esc to go back)\n"
-    printf "Leave empty to use default [%s]: " "$DEFAULT_DATA_DIR"
-    DATA_DIR=$(read_input) || return 1
-    DATA_DIR="${DATA_DIR:-$DEFAULT_DATA_DIR}"
-    case "$DATA_DIR" in
-        ~/*) DATA_DIR="$HOME/${DATA_DIR#~/}" ;;
-        ~) DATA_DIR="$HOME" ;;
-    esac
-    mkdir -p "$DATA_DIR"
-    print_info "Data directory: $DATA_DIR"
+                clear
+                print_banner
+                echo ""
+                printf "${BOLD}Where should Agent Zero store user data?${NC} (Esc to go back)\n"
+                printf "Leave empty to use default [%s]: " "$DEFAULT_DATA_DIR"
+                DATA_DIR=$(read_input) || { WIZARD_STEP=2; continue; }
+                DATA_DIR="${DATA_DIR:-$DEFAULT_DATA_DIR}"
+                case "$DATA_DIR" in
+                    ~/*) DATA_DIR="$HOME/${DATA_DIR#~/}" ;;
+                    ~) DATA_DIR="$HOME" ;;
+                esac
+                mkdir -p "$DATA_DIR"
+                print_info "Data directory: $DATA_DIR"
+                WIZARD_STEP=4
+                ;;
 
-    # Port
-    echo ""
-    printf "${BOLD}What port should Agent Zero Web UI run on?${NC} (Esc to go back)\n"
-    printf "Leave empty to use default [%s]: " "$DEFAULT_PORT"
-    PORT=$(read_input) || return 1
-    PORT="${PORT:-$DEFAULT_PORT}"
-    case "$PORT" in
-        ''|*[!0-9]*)
-        print_error "Invalid port. Falling back to ${DEFAULT_PORT}."
-        PORT="$DEFAULT_PORT"
-        ;;
-    esac
-    print_info "Web UI port: $PORT"
+            4)  # Port
+                clear
+                print_banner
+                echo ""
+                printf "${BOLD}What port should Agent Zero Web UI run on?${NC} (Esc to go back)\n"
+                printf "Leave empty to use default [%s]: " "$DEFAULT_PORT"
+                PORT=$(read_input) || { WIZARD_STEP=3; continue; }
+                PORT="${PORT:-$DEFAULT_PORT}"
+                case "$PORT" in
+                    ''|*[!0-9]*)
+                    print_error "Invalid port. Falling back to ${DEFAULT_PORT}."
+                    PORT="$DEFAULT_PORT"
+                    ;;
+                esac
+                print_info "Web UI port: $PORT"
+                WIZARD_STEP=5
+                ;;
 
-    # Authentication
-    echo ""
-    printf "${BOLD}What login username should be used for the Web UI?${NC} (Esc to go back)\n"
-    printf "Leave empty for no authentication: "
-    AUTH_LOGIN=$(read_input) || return 1
-    AUTH_PASSWORD=""
-    if [ -n "$AUTH_LOGIN" ]; then
-        echo ""
-        printf "${BOLD}What password should be used?${NC} (Esc to go back)\n"
-        printf "Leave empty to use default [12345678]: "
-        AUTH_PASSWORD=$(read_input) || return 1
-        AUTH_PASSWORD="${AUTH_PASSWORD:-12345678}"
-        print_info "Auth configured for user: $AUTH_LOGIN"
-    else
-        print_warn "No authentication will be configured."
-    fi
+            5)  # Auth username
+                clear
+                print_banner
+                echo ""
+                printf "${BOLD}What login username should be used for the Web UI?${NC} (Esc to go back)\n"
+                printf "Leave empty for no authentication: "
+                AUTH_LOGIN=$(read_input) || { WIZARD_STEP=4; continue; }
+                AUTH_PASSWORD=""
+                if [ -n "$AUTH_LOGIN" ]; then
+                    WIZARD_STEP=6
+                else
+                    print_warn "No authentication will be configured."
+                    WIZARD_STEP=7  # Done gathering input
+                fi
+                ;;
+
+            6)  # Auth password (only reached if username was provided)
+                clear
+                print_banner
+                echo ""
+                printf "${BOLD}What password should be used?${NC} (Esc to go back)\n"
+                printf "Leave empty to use default [12345678]: "
+                AUTH_PASSWORD=$(read_input) || { WIZARD_STEP=5; continue; }
+                AUTH_PASSWORD="${AUTH_PASSWORD:-12345678}"
+                print_info "Auth configured for user: $AUTH_LOGIN"
+                WIZARD_STEP=7  # Done gathering input
+                ;;
+        esac
+    done
 
     echo ""
     print_info "Configuration complete. Setting up Agent Zero..."
     echo ""
 
     # -----------------------------------------------------------
-    # 3. Generate docker-compose.yml
+    # 3. Pull image & start container
     # -----------------------------------------------------------
     mkdir -p "$INSTANCE_DIR"
 
-    COMPOSE_FILE="$INSTANCE_DIR/docker-compose.yml"
+    local IMAGE="agent0ai/agent-zero:$SELECTED_TAG"
 
-    {
-        echo "services:"
-        echo "  agent-zero:"
-        echo "    image: agent0ai/agent-zero:$SELECTED_TAG"
-        echo "    container_name: $CONTAINER_NAME"
-        echo "    restart: unless-stopped"
-        echo "    ports:"
-        echo "      - \"${PORT}:80\""
-        echo "    volumes:"
-        echo "      - \"${DATA_DIR}:/a0/usr\""
-        if [ -n "$AUTH_LOGIN" ]; then
-            echo "    environment:"
-            echo "      - AUTH_LOGIN=${AUTH_LOGIN}"
-            echo "      - AUTH_PASSWORD=${AUTH_PASSWORD}"
-        fi
-    } > "$COMPOSE_FILE"
-
-    print_info "Created $COMPOSE_FILE"
-
-    # -----------------------------------------------------------
-    # 4. Pull image & start container
-    # -----------------------------------------------------------
     print_info "Pulling Agent Zero image (this may take a moment)..."
-    docker compose -f "$COMPOSE_FILE" pull --quiet
+    docker pull --quiet "$IMAGE"
 
     print_info "Starting Agent Zero..."
-    docker compose -f "$COMPOSE_FILE" up -d
+    local DOCKER_RUN_ARGS=(
+        --name "$CONTAINER_NAME"
+        --restart unless-stopped
+        -p "${PORT}:80"
+        -v "${DATA_DIR}:/a0/usr"
+        -d
+    )
+    if [ -n "$AUTH_LOGIN" ]; then
+        DOCKER_RUN_ARGS+=(-e "AUTH_LOGIN=${AUTH_LOGIN}" -e "AUTH_PASSWORD=${AUTH_PASSWORD}")
+    fi
+    docker run "${DOCKER_RUN_ARGS[@]}" "$IMAGE"
 
     # -----------------------------------------------------------
-    # 5. Wait for the service to become ready
+    # 4. Wait for the service to become ready
     # -----------------------------------------------------------
     wait_for_ready "http://localhost:$PORT"
 
@@ -715,11 +741,8 @@ manage_instances() {
 
             # Handle escape sequences (arrow keys) and bare Escape (go back)
             if [ "$key" = $'\x1b' ]; then
-                IFS= read -rsn1 -t 1 key2 </dev/tty 2>/dev/null || true
-                if [ -z "$key2" ]; then
-                    # Bare Escape pressed — go back to main menu
-                    return 0
-                elif [ "$key2" = "[" ]; then
+                IFS= read -rsn1 -t 1 key2 </dev/tty 2>/dev/null || key2=""
+                if [ "$key2" = "[" ]; then
                     IFS= read -rsn1 key3 </dev/tty
                     case "$key3" in
                         A) # Up arrow
@@ -735,6 +758,9 @@ manage_instances() {
                             fi
                             ;;
                     esac
+                else
+                    # Bare Escape pressed — go back to main menu
+                    return 0
                 fi
             fi
         done
@@ -928,6 +954,10 @@ main() {
             exit 0
         fi
         manage_single_instance "$CREATED_CONTAINER_NAME"
+        # After returning from manage (Esc/back), enter the main menu loop.
+        # There is now at least 1 container so the user gets a proper menu
+        # instead of the script silently exiting.
+        main_menu_for_existing
     fi
 }
 

@@ -170,6 +170,11 @@ function select_from_menu {
 
     $selectedIndex = 0
 
+    # Flush any buffered keypresses so stale input doesn't auto-select an option
+    while ([Console]::KeyAvailable) {
+        [void][Console]::ReadKey($true)
+    }
+
     while ($true) {
         Clear-Host
         Show-Banner
@@ -274,28 +279,36 @@ function wait_for_docker_daemon {
 }
 
 function check_docker {
-    if (Get-Command docker -ErrorAction SilentlyContinue) {
-        print_ok "Docker already installed"
-    }
-    else {
-        print_warn "Docker not found. Please install Docker Desktop from https://www.docker.com/products/docker-desktop/"
-        try {
-            Start-Process 'https://www.docker.com/products/docker-desktop/'
-        }
-        catch {
-            # ignore and continue with manual instructions
-        }
-        print_error "Docker is required. Install Docker Desktop, start it, then re-run this script."
-        exit 1
-    }
+    if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
+        # Docker not found — show interactive menu instead of auto-opening browser
+        while ($true) {
+            $idx = select_from_menu -Header 'Docker is not installed. Please install Docker Desktop to continue.' `
+                -Options @('Open Docker Desktop download page', 'Check again')
 
-    & docker compose version *> $null
-    if ($LASTEXITCODE -eq 0) {
-        print_ok "Docker Compose available"
+            if ($idx -eq -1) {
+                # Esc pressed — exit
+                exit 0
+            }
+
+            if ($idx -eq 0) {
+                try {
+                    Start-Process 'https://www.docker.com/products/docker-desktop/'
+                    print_ok 'Opened Docker Desktop download page in browser.'
+                }
+                catch {
+                    print_warn 'Could not open browser. Please visit https://www.docker.com/products/docker-desktop/ manually.'
+                }
+            }
+
+            # Check again (both after opening page or explicit "Check again")
+            if (Get-Command docker -ErrorAction SilentlyContinue) {
+                print_ok 'Docker found'
+                break
+            }
+        }
     }
     else {
-        print_error "Docker Compose plugin not found. Please install Docker Compose."
-        exit 1
+        print_ok "Docker already installed"
     }
 
     if (-not (check_docker_daemon_running)) {
@@ -532,150 +545,180 @@ function Expand-UserPath {
     return $PathValue
 }
 
-function Convert-ToComposePath {
+function Convert-ToDockerPath {
     param([string]$PathValue)
 
     return $PathValue -replace '\\', '/'
 }
 
-function New-ComposeFileContent {
-    param(
-        [string]$Tag,
-        [string]$ContainerName,
-        [string]$Port,
-        [string]$DataDir,
-        [string]$AuthLogin,
-        [string]$AuthPassword
-    )
-
-    $dataDirForCompose = Convert-ToComposePath -PathValue $DataDir
-    $lines = New-Object System.Collections.Generic.List[string]
-
-    $lines.Add('services:')
-    $lines.Add('  agent-zero:')
-    $lines.Add("    image: agent0ai/agent-zero:$Tag")
-    $lines.Add("    container_name: $ContainerName")
-    $lines.Add('    restart: unless-stopped')
-    $lines.Add('    ports:')
-    $lines.Add("      - `"${Port}:80`"")
-    $lines.Add('    volumes:')
-    $lines.Add("      - `"${dataDirForCompose}:/a0/usr`"")
-
-    if (-not [string]::IsNullOrWhiteSpace($AuthLogin)) {
-        $lines.Add('    environment:')
-        $lines.Add("      - AUTH_LOGIN=$AuthLogin")
-        $lines.Add("      - AUTH_PASSWORD=$AuthPassword")
-    }
-
-    return $lines.ToArray()
-}
-
 # Returns $true on success, $false if user pressed Escape to go back.
 function create_instance {
+    # -----------------------------------------------------------
+    # Gather configuration from user (step-based wizard)
+    #   Esc on any step goes back to the previous step.
+    #   Esc on the first step aborts create_instance (returns $false).
+    # -----------------------------------------------------------
     $installRoot = Join-Path $script:HomeDir '.agentzero'
+
+    # Variables populated across wizard steps
+    $containerName = ''
+    $dataDir = ''
+    $port = ''
+    $authLogin = ''
+    $authPassword = ''
+
+    # Compute defaults once up front
     $defaultPort = Find-FreePort -BasePort 5080
     $defaultName = suggest_next_instance_name -BaseName 'agent-zero'
 
-    # Tag selection (Escape aborts create_instance)
-    if (-not (select_image_tag)) {
-        return $false
-    }
+    $wizardStep = 1
+    while ($wizardStep -ge 1 -and $wizardStep -le 6) {
+        switch ($wizardStep) {
+            1 {
+                # Tag / version selection (uses its own full-screen menu)
+                if (select_image_tag) {
+                    $wizardStep = 2
+                }
+                else {
+                    return $false  # Esc on first step - abort
+                }
+            }
 
-    # Container / instance name
-    Write-Host ''
-    Write-Host 'What should this instance be called?' -ForegroundColor White -NoNewline
-    Write-Host ' (Esc to go back)'
-    Write-Host "Leave empty to use default [$defaultName]: " -NoNewline
-    $containerName = Read-InputWithEscape
-    if ($null -eq $containerName) { return $false }
-    if ([string]::IsNullOrWhiteSpace($containerName)) {
-        $containerName = $defaultName
-    }
+            2 {
+                # Container / instance name
+                Clear-Host
+                Show-Banner
+                Write-Host ''
+                Write-Host 'What should this instance be called?' -ForegroundColor White -NoNewline
+                Write-Host ' (Esc to go back)'
+                Write-Host "Leave empty to use default [$defaultName]: " -NoNewline
+                $containerName = Read-InputWithEscape
+                if ($null -eq $containerName) { $wizardStep = 1; continue }
+                if ([string]::IsNullOrWhiteSpace($containerName)) {
+                    $containerName = $defaultName
+                }
 
-    if (instance_name_taken -NameToCheck $containerName) {
-        $suggestedName = suggest_next_instance_name -BaseName $containerName
-        print_warn "Instance name '$containerName' is already taken. Using '$suggestedName'."
-        $containerName = $suggestedName
-    }
-    print_info "Instance name: $containerName"
+                if (instance_name_taken -NameToCheck $containerName) {
+                    $suggestedName = suggest_next_instance_name -BaseName $containerName
+                    print_warn "Instance name '$containerName' is already taken. Using '$suggestedName'."
+                    $containerName = $suggestedName
+                }
+                print_info "Instance name: $containerName"
+                $wizardStep = 3
+            }
 
-    $instanceDir = Join-Path $installRoot $containerName
-    $defaultDataDir = Join-Path $instanceDir 'usr'
+            3 {
+                # Data directory
+                $instanceDir = Join-Path $installRoot $containerName
+                $defaultDataDir = Join-Path $instanceDir 'usr'
 
-    # Data directory
-    Write-Host ''
-    Write-Host 'Where should Agent Zero store user data?' -ForegroundColor White -NoNewline
-    Write-Host ' (Esc to go back)'
-    Write-Host "Leave empty to use default [$defaultDataDir]: " -NoNewline
-    $dataDir = Read-InputWithEscape
-    if ($null -eq $dataDir) { return $false }
-    if ([string]::IsNullOrWhiteSpace($dataDir)) {
-        $dataDir = $defaultDataDir
-    }
-    $dataDir = Expand-UserPath -PathValue $dataDir
-    New-Item -ItemType Directory -Force -Path $dataDir *> $null
-    print_info "Data directory: $dataDir"
+                Clear-Host
+                Show-Banner
+                Write-Host ''
+                Write-Host 'Where should Agent Zero store user data?' -ForegroundColor White -NoNewline
+                Write-Host ' (Esc to go back)'
+                Write-Host "Leave empty to use default [$defaultDataDir]: " -NoNewline
+                $dataDir = Read-InputWithEscape
+                if ($null -eq $dataDir) { $wizardStep = 2; continue }
+                if ([string]::IsNullOrWhiteSpace($dataDir)) {
+                    $dataDir = $defaultDataDir
+                }
+                $dataDir = Expand-UserPath -PathValue $dataDir
+                New-Item -ItemType Directory -Force -Path $dataDir *> $null
+                print_info "Data directory: $dataDir"
+                $wizardStep = 4
+            }
 
-    # Port
-    Write-Host ''
-    Write-Host 'What port should Agent Zero Web UI run on?' -ForegroundColor White -NoNewline
-    Write-Host ' (Esc to go back)'
-    Write-Host "Leave empty to use default [$defaultPort]: " -NoNewline
-    $port = Read-InputWithEscape
-    if ($null -eq $port) { return $false }
-    if ([string]::IsNullOrWhiteSpace($port)) {
-        $port = "$defaultPort"
-    }
-    if ($port -notmatch '^[0-9]+$') {
-        print_error "Invalid port. Falling back to $defaultPort."
-        $port = "$defaultPort"
-    }
-    print_info "Web UI port: $port"
+            4 {
+                # Port
+                Clear-Host
+                Show-Banner
+                Write-Host ''
+                Write-Host 'What port should Agent Zero Web UI run on?' -ForegroundColor White -NoNewline
+                Write-Host ' (Esc to go back)'
+                Write-Host "Leave empty to use default [$defaultPort]: " -NoNewline
+                $port = Read-InputWithEscape
+                if ($null -eq $port) { $wizardStep = 3; continue }
+                if ([string]::IsNullOrWhiteSpace($port)) {
+                    $port = "$defaultPort"
+                }
+                if ($port -notmatch '^[0-9]+$') {
+                    print_error "Invalid port. Falling back to $defaultPort."
+                    $port = "$defaultPort"
+                }
+                print_info "Web UI port: $port"
+                $wizardStep = 5
+            }
 
-    # Authentication
-    Write-Host ''
-    Write-Host 'What login username should be used for the Web UI?' -ForegroundColor White -NoNewline
-    Write-Host ' (Esc to go back)'
-    Write-Host 'Leave empty for no authentication: ' -NoNewline
-    $authLogin = Read-InputWithEscape
-    if ($null -eq $authLogin) { return $false }
-    $authPassword = ''
-    if (-not [string]::IsNullOrWhiteSpace($authLogin)) {
-        Write-Host ''
-        Write-Host 'What password should be used?' -ForegroundColor White -NoNewline
-        Write-Host ' (Esc to go back)'
-        Write-Host 'Leave empty to use default [12345678]: ' -NoNewline
-        $authPassword = Read-InputWithEscape
-        if ($null -eq $authPassword) { return $false }
-        if ([string]::IsNullOrWhiteSpace($authPassword)) {
-            $authPassword = '12345678'
+            5 {
+                # Auth username
+                Clear-Host
+                Show-Banner
+                Write-Host ''
+                Write-Host 'What login username should be used for the Web UI?' -ForegroundColor White -NoNewline
+                Write-Host ' (Esc to go back)'
+                Write-Host 'Leave empty for no authentication: ' -NoNewline
+                $authLogin = Read-InputWithEscape
+                if ($null -eq $authLogin) { $wizardStep = 4; continue }
+                $authPassword = ''
+                if (-not [string]::IsNullOrWhiteSpace($authLogin)) {
+                    $wizardStep = 6
+                }
+                else {
+                    print_warn 'No authentication will be configured.'
+                    $wizardStep = 7  # Done gathering input
+                }
+            }
+
+            6 {
+                # Auth password (only reached if username was provided)
+                Clear-Host
+                Show-Banner
+                Write-Host ''
+                Write-Host 'What password should be used?' -ForegroundColor White -NoNewline
+                Write-Host ' (Esc to go back)'
+                Write-Host 'Leave empty to use default [12345678]: ' -NoNewline
+                $authPassword = Read-InputWithEscape
+                if ($null -eq $authPassword) { $wizardStep = 5; continue }
+                if ([string]::IsNullOrWhiteSpace($authPassword)) {
+                    $authPassword = '12345678'
+                }
+                print_info "Auth configured for user: $authLogin"
+                $wizardStep = 7  # Done gathering input
+            }
         }
-        print_info "Auth configured for user: $authLogin"
-    }
-    else {
-        print_warn 'No authentication will be configured.'
     }
 
     Write-Host ''
     print_info 'Configuration complete. Setting up Agent Zero...'
     Write-Host ''
 
+    $instanceDir = Join-Path $installRoot $containerName
     New-Item -ItemType Directory -Force -Path $instanceDir *> $null
-    $composeFile = Join-Path $instanceDir 'docker-compose.yml'
 
-    $composeLines = New-ComposeFileContent -Tag $script:SelectedTag -ContainerName $containerName -Port $port -DataDir $dataDir -AuthLogin $authLogin -AuthPassword $authPassword
-    Set-Content -Path $composeFile -Value $composeLines -Encoding Ascii
-
-    print_info "Created $composeFile"
+    $image = "agent0ai/agent-zero:$($script:SelectedTag)"
 
     print_info 'Pulling Agent Zero image (this may take a moment)...'
-    & docker compose -f $composeFile pull --quiet
+    & docker pull --quiet $image
     if ($LASTEXITCODE -ne 0) {
         throw 'Failed to pull Docker image.'
     }
 
     print_info 'Starting Agent Zero...'
-    & docker compose -f $composeFile up -d
+    $dataDirDocker = Convert-ToDockerPath -PathValue $dataDir
+    $runArgs = @(
+        'run'
+        '--name', $containerName
+        '--restart', 'unless-stopped'
+        '-p', "${port}:80"
+        '-v', "${dataDirDocker}:/a0/usr"
+        '-d'
+    )
+    if (-not [string]::IsNullOrWhiteSpace($authLogin)) {
+        $runArgs += @('-e', "AUTH_LOGIN=$authLogin", '-e', "AUTH_PASSWORD=$authPassword")
+    }
+    $runArgs += $image
+    & docker @runArgs
     if ($LASTEXITCODE -ne 0) {
         throw 'Failed to start Agent Zero.'
     }
@@ -879,7 +922,7 @@ function manage_single_instance {
                         print_error "Failed to delete '$ContainerName'."
                     }
                     Wait-ForKeypress
-                    break  # Container no longer exists
+                    return  # Container no longer exists
                 }
                 else {
                     print_info 'Delete cancelled.'
@@ -887,7 +930,7 @@ function manage_single_instance {
                 }
             }
             'back' {
-                break
+                return
             }
             default {
                 print_warn 'Invalid action. Please try again.'
