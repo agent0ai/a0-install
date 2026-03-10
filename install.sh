@@ -111,59 +111,25 @@ find_free_port() {
     printf "%d\n" "$BASE_PORT"
 }
 
-# Readline-based text input with Ctrl-C to go back.
+# Readline-based text input with Ctrl-D to go back.
 # Uses bash's built-in `read -e` for native line-editing (arrows, Home/End, etc.).
-# Runs `read -e` in a subshell (SIGINT untrapped) so Ctrl-C kills it instantly,
-# while the parent traps SIGINT to survive. Result passed via temp file.
 #   - Enter to submit (result stored in INPUT_VALUE, returns 0)
-#   - Ctrl-C to abort / go back (returns 1)
+#   - Ctrl-D to abort / go back (returns 1)
+# Ctrl-C retains its default behavior (exit the installer).
 # Usage: read_input || { handle_go_back; }
 #        then use $INPUT_VALUE
 INPUT_VALUE=""
 read_input() {
     INPUT_VALUE=""
-
-    # We need Ctrl-C to instantly abort `read -e` and signal "go back".
-    #
-    # Problem: when bash traps SIGINT, the builtin `read` catches the signal,
-    # runs the trap, then **resumes waiting for input**. The user must press
-    # another key before the flag is ever checked.
-    #
-    # Solution: run `read -e` in a subshell where SIGINT is NOT trapped.
-    # Ctrl-C kills the subshell's `read` immediately. The parent shell traps
-    # SIGINT (so it survives), detects the child's non-zero exit, and returns 1.
-    #
-    # The subshell inherits stdin/stdout/stderr (the real terminal), so
-    # `read -e` can echo typed characters and provide readline editing.
-    # Result is passed back via a temp file (not command substitution, which
-    # would capture stdout and make typed text invisible).
-
-    local _ri_tmpfile
-    _ri_tmpfile="$(mktemp "${TMPDIR:-/tmp}/ri_XXXXXX")"
-
-    # Parent traps SIGINT to survive it (SIGINT goes to entire process group).
-    trap '' INT
-
-    local _ri_rc=0
-    (
-        # Reset SIGINT to default in the subshell so Ctrl-C kills `read` instantly.
-        trap - INT
-        IFS= read -er _ri_line
-        printf '%s' "$_ri_line" > "$_ri_tmpfile"
-    ) || _ri_rc=$?
-
-    # Restore default SIGINT handling in the parent.
-    trap - INT
-
-    if [ "$_ri_rc" -ne 0 ]; then
-        rm -f "$_ri_tmpfile"
+    local _ri_line=""
+    if IFS= read -er _ri_line; then
+        INPUT_VALUE="$_ri_line"
+        return 0
+    else
+        # Ctrl-D (EOF) causes read to return non-zero.
         printf "\n"
         return 1
     fi
-
-    INPUT_VALUE="$(cat "$_ri_tmpfile")"
-    rm -f "$_ri_tmpfile"
-    return 0
 }
 
 select_from_menu() {
@@ -552,8 +518,8 @@ select_image_tag() {
 create_instance() {
     # -----------------------------------------------------------
     # 2. Gather configuration from user (step-based wizard)
-    #    Ctrl-C on any step goes back to the previous step.
-    #    Ctrl-C on the first step aborts create_instance (returns 1).
+    #    Ctrl-D on any step goes back to the previous step.
+    #    Ctrl-D on the first step aborts create_instance (returns 1).
     # -----------------------------------------------------------
     INSTALL_ROOT="$HOME/.agentzero"
 
@@ -584,7 +550,7 @@ create_instance() {
                 clear
                 print_banner
                 echo ""
-                printf "${BOLD}What should this instance be called?${NC} (Ctrl-C to go back)\n"
+                printf "${BOLD}What should this instance be called?${NC} (Ctrl-D to go back)\n"
                 printf "Leave empty to use default [%s]: " "$DEFAULT_NAME"
                 read_input || { WIZARD_STEP=1; continue; }
                 CONTAINER_NAME="${INPUT_VALUE:-$DEFAULT_NAME}"
@@ -605,7 +571,7 @@ create_instance() {
                 clear
                 print_banner
                 echo ""
-                printf "${BOLD}Where should Agent Zero store user data?${NC} (Ctrl-C to go back)\n"
+                printf "${BOLD}Where should Agent Zero store user data?${NC} (Ctrl-D to go back)\n"
                 printf "Leave empty to use default [%s]: " "$DEFAULT_DATA_DIR"
                 read_input || { WIZARD_STEP=2; continue; }
                 DATA_DIR="${INPUT_VALUE:-$DEFAULT_DATA_DIR}"
@@ -622,7 +588,7 @@ create_instance() {
                 clear
                 print_banner
                 echo ""
-                printf "${BOLD}What port should Agent Zero Web UI run on?${NC} (Ctrl-C to go back)\n"
+                printf "${BOLD}What port should Agent Zero Web UI run on?${NC} (Ctrl-D to go back)\n"
                 printf "Leave empty to use default [%s]: " "$DEFAULT_PORT"
                 read_input || { WIZARD_STEP=3; continue; }
                 PORT="${INPUT_VALUE:-$DEFAULT_PORT}"
@@ -640,7 +606,7 @@ create_instance() {
                 clear
                 print_banner
                 echo ""
-                printf "${BOLD}What login username should be used for the Web UI?${NC} (Ctrl-C to go back)\n"
+                printf "${BOLD}What login username should be used for the Web UI?${NC} (Ctrl-D to go back)\n"
                 printf "Leave empty for no authentication: "
                 read_input || { WIZARD_STEP=4; continue; }
                 AUTH_LOGIN="$INPUT_VALUE"
@@ -657,7 +623,7 @@ create_instance() {
                 clear
                 print_banner
                 echo ""
-                printf "${BOLD}What password should be used?${NC} (Ctrl-C to go back)\n"
+                printf "${BOLD}What password should be used?${NC} (Ctrl-D to go back)\n"
                 printf "Leave empty to use default [12345678]: "
                 read_input || { WIZARD_STEP=5; continue; }
                 AUTH_PASSWORD="${INPUT_VALUE:-12345678}"
