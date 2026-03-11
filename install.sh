@@ -179,7 +179,7 @@ select_from_menu() {
 
         # Show help text
         echo "" >/dev/tty
-        printf "Use ↑/↓ to navigate, Enter to select, Esc to go back\n" >/dev/tty
+        printf "Use ↑/↓ to navigate, Enter to select, Esc to go back, Ctrl+C to exit\n" >/dev/tty
 
         # Read single character from terminal
         IFS= read -rsn1 key </dev/tty
@@ -710,7 +710,7 @@ manage_instances() {
 
             # Show help text
             echo "" >/dev/tty
-            printf "Use ↑/↓ to navigate, Enter to select, Esc to go back\n" >/dev/tty
+            printf "Use ↑/↓ to navigate, Enter to select, Esc to go back, Ctrl+C to exit\n" >/dev/tty
 
             # Read single character from terminal
             IFS= read -rsn1 key </dev/tty
