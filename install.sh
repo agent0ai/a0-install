@@ -46,6 +46,17 @@ if (read -t 0.01 -rsn1 _probe < /dev/null) 2>/dev/null; then
     HAS_FRACTIONAL_TIMEOUT=1
 fi
 
+# Save original tty settings and restore them on exit.
+# This ensures the terminal is never left in a broken state (e.g. no echo)
+# if the script is interrupted or exits while stty is modified.
+_ORIGINAL_TTY_SETTINGS="$(stty -g </dev/tty 2>/dev/null || true)"
+restore_tty() {
+    [ -n "$_ORIGINAL_TTY_SETTINGS" ] && stty "$_ORIGINAL_TTY_SETTINGS" </dev/tty 2>/dev/null || true
+}
+trap restore_tty EXIT
+trap 'restore_tty; exit 130' INT
+trap 'restore_tty; exit 143' TERM HUP
+
 # Read a single byte from /dev/tty with a short (~0.1s) timeout.
 # Used to disambiguate bare Escape from arrow-key escape sequences.
 # Sets _TIMED_KEY to the byte read, or "" on timeout. Returns 0 on
@@ -267,9 +278,15 @@ read_input() {
             continue
         fi
 
+        # Ctrl-C — exit the installer
+        if [ "$_ch" = $'\x03' ]; then
+            printf "\n" >/dev/tty
+            exit 130
+        fi
+
         # Ignore other control characters
         case "$_ch" in
-            $'\x00'|$'\x02'|$'\x03'|$'\x06'|$'\x07'|$'\x09'|$'\x0c'|$'\x0e'|$'\x0f'|$'\x10'|$'\x11'|$'\x12'|$'\x13'|$'\x14'|$'\x16'|$'\x17'|$'\x18'|$'\x19'|$'\x1a'|$'\x1c'|$'\x1d'|$'\x1e'|$'\x1f')
+            $'\x00'|$'\x02'|$'\x06'|$'\x07'|$'\x09'|$'\x0c'|$'\x0e'|$'\x0f'|$'\x10'|$'\x11'|$'\x12'|$'\x13'|$'\x14'|$'\x16'|$'\x17'|$'\x18'|$'\x19'|$'\x1a'|$'\x1c'|$'\x1d'|$'\x1e'|$'\x1f')
                 continue
                 ;;
         esac
@@ -336,6 +353,12 @@ select_from_menu() {
         if [ -z "$key" ] || [ "$key" = $'\n' ]; then
             printf "%d\n" "$SELECTED_INDEX"
             return 0
+        fi
+
+        # Handle Ctrl-C — exit the installer
+        if [ "$key" = $'\x03' ]; then
+            printf "\n" >/dev/tty
+            exit 130
         fi
 
         # Handle Backspace key (go back)
@@ -643,7 +666,8 @@ select_image_tag() {
 
     # Build menu from the tag list
     # shellcheck disable=SC2086
-    SELECTED_INDEX=$(select_from_menu "--header=Select version:" $MENU_TAGS) || true
+    _rc=0; SELECTED_INDEX=$(select_from_menu "--header=Select version:" $MENU_TAGS) || _rc=$?
+    [ "$_rc" -eq 130 ] && exit 130
 
     # Handle go-back
     if [ "$SELECTED_INDEX" = "-1" ]; then
@@ -927,7 +951,8 @@ manage_single_instance() {
         INSTANCE_HEADER="Selected: $SELECTED_NAME ($SELECTED_IMAGE, $SELECTED_STATUS)"
 
         if [ "$IS_RUNNING" -eq 1 ]; then
-            ACTION_INDEX=$(select_from_menu "--header=$INSTANCE_HEADER" "Open in browser" "Restart" "Stop" "Delete" "Back") || true
+            _rc=0; ACTION_INDEX=$(select_from_menu "--header=$INSTANCE_HEADER" "Open in browser" "Restart" "Stop" "Delete" "Back") || _rc=$?
+            [ "$_rc" -eq 130 ] && exit 130
             case "$ACTION_INDEX" in
                 -1) ACTION_KEY="back" ;;  # Escape/Backspace — go back
                 0) ACTION_KEY="open" ;;
@@ -938,7 +963,8 @@ manage_single_instance() {
                 *) ACTION_KEY="invalid" ;;
             esac
         else
-            ACTION_INDEX=$(select_from_menu "--header=$INSTANCE_HEADER" "Start" "Delete" "Back") || true
+            _rc=0; ACTION_INDEX=$(select_from_menu "--header=$INSTANCE_HEADER" "Start" "Delete" "Back") || _rc=$?
+            [ "$_rc" -eq 130 ] && exit 130
             case "$ACTION_INDEX" in
                 -1) ACTION_KEY="back" ;;  # Escape/Backspace — go back
                 0) ACTION_KEY="start" ;;
@@ -1037,7 +1063,8 @@ main_menu_for_existing() {
 
         if [ "$MENU_COUNT" -gt 0 ]; then
             HEADER="Detected ${MENU_COUNT} Agent Zero container(s). What would you like to do?"
-            SELECTED_INDEX=$(select_from_menu "--header=$HEADER" "Install new instance" "Manage existing instances" "Exit") || true
+            _rc=0; SELECTED_INDEX=$(select_from_menu "--header=$HEADER" "Install new instance" "Manage existing instances" "Exit") || _rc=$?
+            [ "$_rc" -eq 130 ] && exit 130
 
             case "$SELECTED_INDEX" in
                 -1) exit 0 ;;    # Escape/Backspace — exit
