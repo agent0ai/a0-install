@@ -394,31 +394,46 @@ function Wait-ForReady {
     return $false
 }
 
-# Uses image name string matching instead of ancestor filter.
-# The ancestor filter matches by image ID, not name, so containers created
-# from a previous version of a tag become invisible after pulling a newer version.
-function count_existing_agent_zero_containers {
-    try {
-        $rows = & docker ps -a --format '{{.Names}}|{{.Image}}' 2>$null
-        if ($LASTEXITCODE -ne 0) {
-            return 0
-        }
+# Discover Agent Zero containers using a hybrid approach:
+#   1. Containers with the "ai.agent0.managed=true" label (new installs)
+#   2. Containers whose Config.Image matches agent0ai/agent-zero (legacy / pre-label)
+# Returns an array of "Name|Image|Status" strings where Image is the friendly
+# reference resolved via Config.Image (survives image re-tagging).
+function List-AgentZeroContainers {
+    $result = New-Object System.Collections.Generic.List[string]
+    $seen = @{}
 
-        $count = 0
-        foreach ($row in (Get-NonEmptyLines $rows)) {
-            $parts = $row -split '\|', 2
-            if ($parts.Count -ge 2) {
-                $image = $parts[1]
-                if ($image -match '^agent0ai/agent-zero(:|$)') {
-                    $count++
-                }
+    try {
+        # --- Pass 1: labeled containers (fast, single docker command) ---
+        $labeled = & docker ps -a --filter 'label=ai.agent0.managed=true' --format '{{.Names}}' 2>$null
+        if ($LASTEXITCODE -eq 0 -and $labeled) {
+            foreach ($name in (Get-NonEmptyLines $labeled)) {
+                $cfgImage = (& docker inspect --format '{{.Config.Image}}' $name 2>$null) | Select-Object -First 1
+                $status = (& docker ps -a --filter "name=^/$name$" --format '{{.Status}}' 2>$null) | Select-Object -First 1
+                $result.Add("$name|$cfgImage|$status")
+                $seen[$name] = $true
             }
         }
-        return $count
+
+        # --- Pass 2: unlabeled containers whose Config.Image matches (legacy) ---
+        $allNames = & docker ps -a --format '{{.Names}}' 2>$null
+        if ($LASTEXITCODE -eq 0 -and $allNames) {
+            foreach ($name in (Get-NonEmptyLines $allNames)) {
+                if ($seen.ContainsKey($name)) { continue }
+                $cfgImage = (& docker inspect --format '{{.Config.Image}}' $name 2>$null) | Select-Object -First 1
+                if (-not ($cfgImage -match '^agent0ai/agent-zero(:|$)')) { continue }
+                $status = (& docker ps -a --filter "name=^/$name$" --format '{{.Status}}' 2>$null) | Select-Object -First 1
+                $result.Add("$name|$cfgImage|$status")
+            }
+        }
     }
-    catch {
-        return 0
-    }
+    catch { }
+
+    return $result.ToArray()
+}
+
+function count_existing_agent_zero_containers {
+    return @(List-AgentZeroContainers).Count
 }
 
 function instance_name_taken {
@@ -735,6 +750,7 @@ function create_instance {
     $runArgs = @(
         'run'
         '--name', $containerName
+        '--label', 'ai.agent0.managed=true'
         '--restart', 'unless-stopped'
         '-p', "${port}:80"
         '-v', "${dataDirDocker}:/a0/usr"
@@ -758,29 +774,8 @@ function create_instance {
     return $true
 }
 
-# Uses image name string matching instead of ancestor filter.
 function Get-AgentZeroContainerRows {
-    try {
-        $rows = & docker ps -a --format '{{.Names}}|{{.Image}}|{{.Status}}' 2>$null
-        if ($LASTEXITCODE -ne 0) {
-            return @()
-        }
-
-        $matched = New-Object System.Collections.Generic.List[string]
-        foreach ($row in (Get-NonEmptyLines $rows)) {
-            $parts = $row -split '\|', 3
-            if ($parts.Count -ge 2) {
-                $image = $parts[1]
-                if ($image -match '^agent0ai/agent-zero(:|$)') {
-                    $matched.Add($row)
-                }
-            }
-        }
-        return $matched.ToArray()
-    }
-    catch {
-        return @()
-    }
+    return @(List-AgentZeroContainers)
 }
 
 function manage_instances {
@@ -828,8 +823,8 @@ function manage_instances {
 function manage_single_instance {
     param([string]$ContainerName)
 
-    # Look up the image for display
-    $selectedImage = ((Get-NonEmptyLines (& docker ps -a --filter "name=^/$ContainerName$" --format '{{.Image}}' 2>$null)) | Select-Object -First 1)
+    # Look up the image for display (Config.Image preserves the original tag even when the image is untagged)
+    $selectedImage = ((Get-NonEmptyLines (& docker inspect --format '{{.Config.Image}}' $ContainerName 2>$null)) | Select-Object -First 1)
 
     while ($true) {
         $statusOutput = & docker ps -a --filter "name=^/$ContainerName$" --format '{{.Status}}' 2>$null

@@ -527,8 +527,52 @@ wait_for_ready() {
     return 1
 }
 
+# Discover Agent Zero containers using a hybrid approach:
+#   1. Containers with the "ai.agent0.managed=true" label (new installs)
+#   2. Containers whose Config.Image matches agent0ai/agent-zero (legacy / pre-label)
+# Outputs one line per container: Name|Image|Status
+# "Image" is the friendly image reference (resolved via Config.Image when docker ps
+# shows a raw hash due to the tag having moved to a newer image).
+list_agent_zero_containers() {
+    local _seen=""
+
+    # --- Pass 1: labeled containers (fast, single docker command) ---
+    local _labeled
+    _labeled="$(docker ps -a --filter "label=ai.agent0.managed=true" \
+        --format '{{.Names}}' 2>/dev/null || true)"
+
+    local _name _cfg_image _status
+    if [ -n "$_labeled" ]; then
+        while IFS= read -r _name; do
+            [ -z "$_name" ] && continue
+            _cfg_image="$(docker inspect --format '{{.Config.Image}}' "$_name" 2>/dev/null || true)"
+            _status="$(docker ps -a --filter "name=^/${_name}$" --format '{{.Status}}' 2>/dev/null | head -n 1)"
+            printf '%s|%s|%s\n' "$_name" "$_cfg_image" "$_status"
+            _seen="${_seen}${_name}|"
+        done <<< "$_labeled"
+    fi
+
+    # --- Pass 2: unlabeled containers whose Config.Image matches (legacy) ---
+    local _all_names
+    _all_names="$(docker ps -a --format '{{.Names}}' 2>/dev/null || true)"
+    if [ -n "$_all_names" ]; then
+        while IFS= read -r _name; do
+            [ -z "$_name" ] && continue
+            # Skip if already found in pass 1
+            case "$_seen" in *"${_name}|"*) continue ;; esac
+            _cfg_image="$(docker inspect --format '{{.Config.Image}}' "$_name" 2>/dev/null || true)"
+            case "$_cfg_image" in
+                agent0ai/agent-zero*) ;;
+                *) continue ;;
+            esac
+            _status="$(docker ps -a --filter "name=^/${_name}$" --format '{{.Status}}' 2>/dev/null | head -n 1)"
+            printf '%s|%s|%s\n' "$_name" "$_cfg_image" "$_status"
+        done <<< "$_all_names"
+    fi
+}
+
 count_existing_agent_zero_containers() {
-    docker ps -a --format '{{.Names}}|{{.Image}}' 2>/dev/null | awk -F'|' '$2 ~ /agent0ai\/agent-zero/ {count++} END {print count+0}'
+    list_agent_zero_containers | awk 'NF {count++} END {print count+0}'
 }
 
 instance_name_taken() {
@@ -824,6 +868,7 @@ create_instance() {
     print_info "Starting Agent Zero..."
     local DOCKER_RUN_ARGS=(
         --name "$CONTAINER_NAME"
+        --label "ai.agent0.managed=true"
         --restart unless-stopped
         -p "${PORT}:80"
         -v "${DATA_DIR}:/a0/usr"
@@ -845,7 +890,7 @@ create_instance() {
 
 manage_instances() {
     while :; do
-        CONTAINER_ROWS="$(docker ps -a --format '{{.Names}}|{{.Image}}|{{.Status}}' 2>/dev/null | awk -F'|' '$2 ~ /agent0ai\/agent-zero/' || true)"
+        CONTAINER_ROWS="$(list_agent_zero_containers)"
 
         if [ -z "$CONTAINER_ROWS" ]; then
             print_warn "No Agent Zero containers found to manage."
@@ -901,7 +946,7 @@ manage_instances() {
 
             # Handle escape sequences (arrow keys) and bare Escape (go back)
             if [ "$key" = $'\x1b' ]; then
-                read_byte_with_short_timeout; key2="$_TIMED_KEY"
+                read_byte_with_short_timeout || true; key2="$_TIMED_KEY"
                 if [ "$key2" = "[" ]; then
                     IFS= read -rsn1 key3 </dev/tty
                     case "$key3" in
@@ -940,8 +985,8 @@ manage_instances() {
 manage_single_instance() {
     SELECTED_NAME="$1"
 
-    # Look up the image for display
-    SELECTED_IMAGE="$(docker ps -a --filter "name=^/${SELECTED_NAME}$" --format '{{.Image}}' 2>/dev/null | head -n 1)"
+    # Look up the image for display (Config.Image preserves the original tag even when the image is untagged)
+    SELECTED_IMAGE="$(docker inspect --format '{{.Config.Image}}' "$SELECTED_NAME" 2>/dev/null || true)"
 
     while :; do
         SELECTED_STATUS="$(docker ps -a --filter "name=^/${SELECTED_NAME}$" --format '{{.Status}}' 2>/dev/null | head -n 1)"
