@@ -42,7 +42,7 @@ print_error() { printf "${RED}[ERROR]${NC} %s\n" "$1"; }
 
 # Detect whether bash supports fractional read timeouts (bash 4+ does, bash 3.2 on macOS does not).
 HAS_FRACTIONAL_TIMEOUT=0
-if (read -t 0.01 -rsn1 _probe < /dev/null) 2>/dev/null; then
+if (IFS= read -r -n 1 -t 0.1 _probe <<< "x") 2>/dev/null; then
     HAS_FRACTIONAL_TIMEOUT=1
 fi
 
@@ -51,7 +51,11 @@ fi
 # if the script is interrupted or exits while stty is modified.
 _ORIGINAL_TTY_SETTINGS="$(stty -g </dev/tty 2>/dev/null || true)"
 restore_tty() {
-    [ -n "$_ORIGINAL_TTY_SETTINGS" ] && stty "$_ORIGINAL_TTY_SETTINGS" </dev/tty 2>/dev/null || true
+    if [ -n "$_ORIGINAL_TTY_SETTINGS" ]; then
+        stty "$_ORIGINAL_TTY_SETTINGS" </dev/tty 2>/dev/null || true
+    else
+        stty sane </dev/tty 2>/dev/null || true
+    fi
 }
 trap restore_tty EXIT
 trap 'restore_tty; exit 130' INT
@@ -72,6 +76,10 @@ read_byte_with_short_timeout() {
         # then use dd to read a single byte.
         local _saved_tty
         _saved_tty="$(stty -g </dev/tty 2>/dev/null)"
+        if [ -z "$_saved_tty" ]; then
+            # Cannot save tty state — skip stty manipulation, just return timeout
+            return 1
+        fi
         # -icanon: byte-at-a-time mode, min 0 time 1: return after 0.1s if no byte
         stty -icanon -echo min 0 time 1 </dev/tty 2>/dev/null
         _TIMED_KEY="$(dd bs=1 count=1 </dev/tty 2>/dev/null)" || true
