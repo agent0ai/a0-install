@@ -946,7 +946,7 @@ manage_instances() {
 
             # Handle escape sequences (arrow keys) and bare Escape (go back)
             if [ "$key" = $'\x1b' ]; then
-                read_byte_with_short_timeout; key2="$_TIMED_KEY"
+                read_byte_with_short_timeout || true; key2="$_TIMED_KEY"
                 if [ "$key2" = "[" ]; then
                     IFS= read -rsn1 key3 </dev/tty
                     case "$key3" in
