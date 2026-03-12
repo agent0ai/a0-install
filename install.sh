@@ -122,7 +122,12 @@ INPUT_VALUE=""
 read_input() {
     INPUT_VALUE=""
     local _ri_line=""
-    if IFS= read -er _ri_line; then
+    # Flush any stale bytes from /dev/tty before reading, so that leftover
+    # input from a previous menu interaction doesn't cause an immediate return.
+    while IFS= read -rsn1 -t 0.01 _junk </dev/tty 2>/dev/null; do :; done
+    # Read from /dev/tty explicitly so that stdin state (which may be EOF or
+    # have buffered data after select_from_menu) does not interfere.
+    if IFS= read -er _ri_line </dev/tty; then
         INPUT_VALUE="$_ri_line"
         return 0
     else
