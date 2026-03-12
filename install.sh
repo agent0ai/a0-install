@@ -40,6 +40,14 @@ print_info()  { printf "${GREEN}[INFO]${NC} %s\n" "$1"; }
 print_warn()  { printf "${YELLOW}[WARN]${NC} %s\n" "$1"; }
 print_error() { printf "${RED}[ERROR]${NC} %s\n" "$1"; }
 
+# Detect whether bash supports fractional read timeouts (bash 4+ does, bash 3.2 on macOS does not).
+# Used for escape-sequence disambiguation: 0.1s is ideal, 1s is the safe fallback.
+if (read -t 0.01 -rsn1 _probe < /dev/null) 2>/dev/null; then
+    ESC_TIMEOUT="0.1"
+else
+    ESC_TIMEOUT="1"
+fi
+
 wait_for_keypress() {
     printf "\nPress any key to continue..."
     IFS= read -rsn1 _key </dev/tty
@@ -103,51 +111,30 @@ find_free_port() {
     printf "%d\n" "$BASE_PORT"
 }
 
-# Escape-aware text input. Reads one line with support for:
-#   - Normal character input and Backspace for editing
-#   - Escape key to abort (prints nothing, returns 1)
-#   - Enter to submit (prints the entered text, returns 0)
-# Usage: VALUE=$(read_input) || return 1
+# Readline-based text input with Ctrl-D to go back.
+# Uses bash's built-in `read -e` for native line-editing (arrows, Home/End, etc.).
+#   - Enter to submit (result stored in INPUT_VALUE, returns 0)
+#   - Ctrl-D to abort / go back (returns 1)
+# Ctrl-C retains its default behavior (exit the installer).
+# Usage: read_input || { handle_go_back; }
+#        then use $INPUT_VALUE
+INPUT_VALUE=""
 read_input() {
-    INPUT_BUF=""
-
-    while :; do
-        # Read a single character (raw, no echo)
-        IFS= read -rsn1 INPUT_CHAR </dev/tty
-
-        # Handle Enter key (empty read)
-        if [ -z "$INPUT_CHAR" ]; then
-            printf "\n" >/dev/tty
-            printf "%s\n" "$INPUT_BUF"
-            return 0
-        fi
-
-        # Handle Escape key
-        if [ "$INPUT_CHAR" = $'\x1b' ]; then
-            # Consume any trailing escape sequence chars (arrow keys etc.)
-            # Note: -t only supports integer seconds in /bin/sh, so we use -t 1.
-            IFS= read -rsn1 -t 1 _discard </dev/tty 2>/dev/null || true
-            if [ "$_discard" = "[" ]; then
-                IFS= read -rsn1 -t 1 _discard2 </dev/tty 2>/dev/null || true
-            fi
-            printf "\n" >/dev/tty
-            return 1
-        fi
-
-        # Handle Backspace (0x7f or 0x08)
-        if [ "$INPUT_CHAR" = $'\x7f' ] || [ "$INPUT_CHAR" = $'\x08' ]; then
-            if [ -n "$INPUT_BUF" ]; then
-                INPUT_BUF="${INPUT_BUF%?}"
-                # Move cursor back, overwrite with space, move back again
-                printf "\b \b" >/dev/tty
-            fi
-            continue
-        fi
-
-        # Regular printable character — append to buffer and echo
-        INPUT_BUF="${INPUT_BUF}${INPUT_CHAR}"
-        printf "%s" "$INPUT_CHAR" >/dev/tty
-    done
+    INPUT_VALUE=""
+    local _ri_line=""
+    # Flush any stale bytes from /dev/tty before reading, so that leftover
+    # input from a previous menu interaction doesn't cause an immediate return.
+    while IFS= read -rsn1 -t 0.01 _junk </dev/tty 2>/dev/null; do :; done
+    # Read from /dev/tty explicitly so that stdin state (which may be EOF or
+    # have buffered data after select_from_menu) does not interfere.
+    if IFS= read -er _ri_line </dev/tty; then
+        INPUT_VALUE="$_ri_line"
+        return 0
+    else
+        # Ctrl-D (EOF) causes read to return non-zero.
+        printf "\n"
+        return 1
+    fi
 }
 
 select_from_menu() {
@@ -167,8 +154,11 @@ select_from_menu() {
     ITEM_COUNT=$#
     SELECTED_INDEX=0
 
-    # Flush any buffered stdin so stale keypresses don't auto-select an option
-    while IFS= read -rsn1 -t 0.1 _junk </dev/tty 2>/dev/null; do :; done
+    # Flush any buffered stdin so stale keypresses don't auto-select an option.
+    # Use a tiny hardcoded timeout (NOT ESC_TIMEOUT) — we just need to drain what's
+    # already buffered.  On bash 3.2 where fractional timeouts fail, `read` returns
+    # non-zero immediately, which exits the loop instantly.  That's fine.
+    while IFS= read -rsn1 -t 0.01 _junk </dev/tty 2>/dev/null; do :; done
 
     while :; do
         # Clear screen
@@ -194,7 +184,7 @@ select_from_menu() {
 
         # Show help text
         echo "" >/dev/tty
-        printf "Use ↑/↓ to navigate, Enter to select, Esc to go back\n" >/dev/tty
+        printf "Use ↑/↓ to navigate, Enter to select, Esc to go back, Ctrl+C to exit\n" >/dev/tty
 
         # Read single character from terminal
         IFS= read -rsn1 key </dev/tty
@@ -215,7 +205,7 @@ select_from_menu() {
         if [ "$key" = $'\x1b' ]; then
             # Read next character with timeout to distinguish bare Escape from arrow keys.
             # Arrow key sequences (\x1b[A) arrive instantly; bare Escape has no follow-up.
-            IFS= read -rsn1 -t 1 key2 </dev/tty 2>/dev/null || key2=""
+            IFS= read -rsn1 -t "$ESC_TIMEOUT" key2 </dev/tty 2>/dev/null || key2=""
             if [ "$key2" = "[" ]; then
                 # Read arrow key identifier
                 IFS= read -rsn1 key3 </dev/tty
@@ -366,7 +356,7 @@ wait_for_ready() {
 }
 
 count_existing_agent_zero_containers() {
-    docker ps -a --format '{{.Names}}|{{.Image}}' 2>/dev/null | awk -F'|' '$2 ~ /^agent0ai\/agent-zero(:|$)/ {count++} END {print count+0}'
+    docker ps -a --format '{{.Names}}|{{.Image}}' 2>/dev/null | awk -F'|' '$2 ~ /agent0ai\/agent-zero/ {count++} END {print count+0}'
 }
 
 instance_name_taken() {
@@ -533,8 +523,8 @@ select_image_tag() {
 create_instance() {
     # -----------------------------------------------------------
     # 2. Gather configuration from user (step-based wizard)
-    #    Esc on any step goes back to the previous step.
-    #    Esc on the first step aborts create_instance (returns 1).
+    #    Ctrl-D on any step goes back to the previous step.
+    #    Ctrl-D on the first step aborts create_instance (returns 1).
     # -----------------------------------------------------------
     INSTALL_ROOT="$HOME/.agentzero"
 
@@ -565,10 +555,10 @@ create_instance() {
                 clear
                 print_banner
                 echo ""
-                printf "${BOLD}What should this instance be called?${NC} (Esc to go back)\n"
+                printf "${BOLD}What should this instance be called?${NC} (Ctrl-D to go back)\n"
                 printf "Leave empty to use default [%s]: " "$DEFAULT_NAME"
-                CONTAINER_NAME=$(read_input) || { WIZARD_STEP=1; continue; }
-                CONTAINER_NAME="${CONTAINER_NAME:-$DEFAULT_NAME}"
+                read_input || { WIZARD_STEP=1; continue; }
+                CONTAINER_NAME="${INPUT_VALUE:-$DEFAULT_NAME}"
 
                 if instance_name_taken "$CONTAINER_NAME"; then
                     SUGGESTED_NAME="$(suggest_next_instance_name "$CONTAINER_NAME")"
@@ -586,10 +576,10 @@ create_instance() {
                 clear
                 print_banner
                 echo ""
-                printf "${BOLD}Where should Agent Zero store user data?${NC} (Esc to go back)\n"
+                printf "${BOLD}Where should Agent Zero store user data?${NC} (Ctrl-D to go back)\n"
                 printf "Leave empty to use default [%s]: " "$DEFAULT_DATA_DIR"
-                DATA_DIR=$(read_input) || { WIZARD_STEP=2; continue; }
-                DATA_DIR="${DATA_DIR:-$DEFAULT_DATA_DIR}"
+                read_input || { WIZARD_STEP=2; continue; }
+                DATA_DIR="${INPUT_VALUE:-$DEFAULT_DATA_DIR}"
                 case "$DATA_DIR" in
                     ~/*) DATA_DIR="$HOME/${DATA_DIR#~/}" ;;
                     ~) DATA_DIR="$HOME" ;;
@@ -603,10 +593,10 @@ create_instance() {
                 clear
                 print_banner
                 echo ""
-                printf "${BOLD}What port should Agent Zero Web UI run on?${NC} (Esc to go back)\n"
+                printf "${BOLD}What port should Agent Zero Web UI run on?${NC} (Ctrl-D to go back)\n"
                 printf "Leave empty to use default [%s]: " "$DEFAULT_PORT"
-                PORT=$(read_input) || { WIZARD_STEP=3; continue; }
-                PORT="${PORT:-$DEFAULT_PORT}"
+                read_input || { WIZARD_STEP=3; continue; }
+                PORT="${INPUT_VALUE:-$DEFAULT_PORT}"
                 case "$PORT" in
                     ''|*[!0-9]*)
                     print_error "Invalid port. Falling back to ${DEFAULT_PORT}."
@@ -621,9 +611,10 @@ create_instance() {
                 clear
                 print_banner
                 echo ""
-                printf "${BOLD}What login username should be used for the Web UI?${NC} (Esc to go back)\n"
+                printf "${BOLD}What login username should be used for the Web UI?${NC} (Ctrl-D to go back)\n"
                 printf "Leave empty for no authentication: "
-                AUTH_LOGIN=$(read_input) || { WIZARD_STEP=4; continue; }
+                read_input || { WIZARD_STEP=4; continue; }
+                AUTH_LOGIN="$INPUT_VALUE"
                 AUTH_PASSWORD=""
                 if [ -n "$AUTH_LOGIN" ]; then
                     WIZARD_STEP=6
@@ -637,10 +628,10 @@ create_instance() {
                 clear
                 print_banner
                 echo ""
-                printf "${BOLD}What password should be used?${NC} (Esc to go back)\n"
+                printf "${BOLD}What password should be used?${NC} (Ctrl-D to go back)\n"
                 printf "Leave empty to use default [12345678]: "
-                AUTH_PASSWORD=$(read_input) || { WIZARD_STEP=5; continue; }
-                AUTH_PASSWORD="${AUTH_PASSWORD:-12345678}"
+                read_input || { WIZARD_STEP=5; continue; }
+                AUTH_PASSWORD="${INPUT_VALUE:-12345678}"
                 print_info "Auth configured for user: $AUTH_LOGIN"
                 WIZARD_STEP=7  # Done gathering input
                 ;;
@@ -685,7 +676,7 @@ create_instance() {
 
 manage_instances() {
     while :; do
-        CONTAINER_ROWS="$(docker ps -a --format '{{.Names}}|{{.Image}}|{{.Status}}' 2>/dev/null | awk -F'|' '$2 ~ /^agent0ai\/agent-zero(:|$)/' || true)"
+        CONTAINER_ROWS="$(docker ps -a --format '{{.Names}}|{{.Image}}|{{.Status}}' 2>/dev/null | awk -F'|' '$2 ~ /agent0ai\/agent-zero/' || true)"
 
         if [ -z "$CONTAINER_ROWS" ]; then
             print_warn "No Agent Zero containers found to manage."
@@ -724,7 +715,7 @@ manage_instances() {
 
             # Show help text
             echo "" >/dev/tty
-            printf "Use ↑/↓ to navigate, Enter to select, Esc to go back\n" >/dev/tty
+            printf "Use ↑/↓ to navigate, Enter to select, Esc to go back, Ctrl+C to exit\n" >/dev/tty
 
             # Read single character from terminal
             IFS= read -rsn1 key </dev/tty
@@ -741,7 +732,7 @@ manage_instances() {
 
             # Handle escape sequences (arrow keys) and bare Escape (go back)
             if [ "$key" = $'\x1b' ]; then
-                IFS= read -rsn1 -t 1 key2 </dev/tty 2>/dev/null || key2=""
+                IFS= read -rsn1 -t "$ESC_TIMEOUT" key2 </dev/tty 2>/dev/null || key2=""
                 if [ "$key2" = "[" ]; then
                     IFS= read -rsn1 key3 </dev/tty
                     case "$key3" in
