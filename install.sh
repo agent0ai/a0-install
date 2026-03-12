@@ -41,12 +41,56 @@ print_warn()  { printf "${YELLOW}[WARN]${NC} %s\n" "$1"; }
 print_error() { printf "${RED}[ERROR]${NC} %s\n" "$1"; }
 
 # Detect whether bash supports fractional read timeouts (bash 4+ does, bash 3.2 on macOS does not).
-# Used for escape-sequence disambiguation: 0.1s is ideal, 1s is the safe fallback.
-if (read -t 0.01 -rsn1 _probe < /dev/null) 2>/dev/null; then
-    ESC_TIMEOUT="0.1"
-else
-    ESC_TIMEOUT="1"
+HAS_FRACTIONAL_TIMEOUT=0
+if (IFS= read -r -n 1 -t 0.1 _probe <<< "x") 2>/dev/null; then
+    HAS_FRACTIONAL_TIMEOUT=1
 fi
+
+# Save original tty settings and restore them on exit.
+# This ensures the terminal is never left in a broken state (e.g. no echo)
+# if the script is interrupted or exits while stty is modified.
+_ORIGINAL_TTY_SETTINGS="$(stty -g </dev/tty 2>/dev/null || true)"
+restore_tty() {
+    if [ -n "$_ORIGINAL_TTY_SETTINGS" ]; then
+        stty "$_ORIGINAL_TTY_SETTINGS" </dev/tty 2>/dev/null || true
+    else
+        stty sane </dev/tty 2>/dev/null || true
+    fi
+}
+trap restore_tty EXIT
+trap 'restore_tty; exit 130' INT
+trap 'restore_tty; exit 143' TERM HUP
+
+# Read a single byte from /dev/tty with a short (~0.1s) timeout.
+# Used to disambiguate bare Escape from arrow-key escape sequences.
+# Sets _TIMED_KEY to the byte read, or "" on timeout. Returns 0 on
+# success, 1 on timeout.
+_TIMED_KEY=""
+read_byte_with_short_timeout() {
+    _TIMED_KEY=""
+    if [ "$HAS_FRACTIONAL_TIMEOUT" -eq 1 ]; then
+        IFS= read -rsn1 -t 0.1 _TIMED_KEY </dev/tty 2>/dev/null || true
+    else
+        # Bash 3.2 (macOS) does not support fractional -t values.
+        # Use stty to configure the tty driver for a non-canonical 0.1s timeout,
+        # then use dd to read a single byte.
+        local _saved_tty
+        _saved_tty="$(stty -g </dev/tty 2>/dev/null)"
+        if [ -z "$_saved_tty" ]; then
+            # Cannot save tty state — skip stty manipulation, just return timeout
+            return 1
+        fi
+        # -icanon: byte-at-a-time mode, min 0 time 1: return after 0.1s if no byte
+        stty -icanon -echo min 0 time 1 </dev/tty 2>/dev/null
+        _TIMED_KEY="$(dd bs=1 count=1 </dev/tty 2>/dev/null)" || true
+        # Restore original tty settings
+        stty "$_saved_tty" </dev/tty 2>/dev/null
+    fi
+    if [ -n "$_TIMED_KEY" ]; then
+        return 0
+    fi
+    return 1
+}
 
 wait_for_keypress() {
     printf "\nPress any key to continue..."
@@ -111,30 +155,155 @@ find_free_port() {
     printf "%d\n" "$BASE_PORT"
 }
 
-# Readline-based text input with Ctrl-D to go back.
-# Uses bash's built-in `read -e` for native line-editing (arrows, Home/End, etc.).
+# Character-by-character text input with pre-filled default and Escape to go back.
+# Supports: backspace, delete, left/right arrows, Home/End, Enter, Escape.
+#   $1 (optional) — default value to pre-fill in the input buffer.
 #   - Enter to submit (result stored in INPUT_VALUE, returns 0)
-#   - Ctrl-D to abort / go back (returns 1)
+#   - Escape to abort / go back (returns 1)
 # Ctrl-C retains its default behavior (exit the installer).
-# Usage: read_input || { handle_go_back; }
+# Usage: read_input "default" || { handle_go_back; }
 #        then use $INPUT_VALUE
 INPUT_VALUE=""
 read_input() {
     INPUT_VALUE=""
-    local _ri_line=""
-    # Flush any stale bytes from /dev/tty before reading, so that leftover
-    # input from a previous menu interaction doesn't cause an immediate return.
+    local _buf="${1-}"
+    local _cur=${#_buf}       # cursor position (index into _buf)
+
+    # Flush any stale bytes from /dev/tty before reading.
     while IFS= read -rsn1 -t 0.01 _junk </dev/tty 2>/dev/null; do :; done
-    # Read from /dev/tty explicitly so that stdin state (which may be EOF or
-    # have buffered data after select_from_menu) does not interfere.
-    if IFS= read -er _ri_line </dev/tty; then
-        INPUT_VALUE="$_ri_line"
-        return 0
-    else
-        # Ctrl-D (EOF) causes read to return non-zero.
-        printf "\n"
-        return 1
-    fi
+
+    # Helper: redraw the current line. Moves to column 0, clears the line,
+    # prints the buffer, then repositions the cursor.
+    _ri_redraw() {
+        # \r          — move to column 0
+        # \033[0K     — clear from cursor to end of line
+        printf "\r\033[0K%s" "$_buf" >/dev/tty
+        # Move cursor to the correct position within the buffer
+        local _tail_len=$(( ${#_buf} - _cur ))
+        if [ "$_tail_len" -gt 0 ]; then
+            printf "\033[%dD" "$_tail_len" >/dev/tty
+        fi
+    }
+
+    # Print initial buffer contents
+    _ri_redraw
+
+    while :; do
+        IFS= read -rsn1 _ch </dev/tty
+
+        # Enter (empty read or literal newline) — submit
+        if [ -z "$_ch" ] || [ "$_ch" = $'\n' ]; then
+            printf "\n" >/dev/tty
+            INPUT_VALUE="$_buf"
+            return 0
+        fi
+
+        # Escape — go back (disambiguate from arrow key sequences)
+        if [ "$_ch" = $'\x1b' ]; then
+            read_byte_with_short_timeout; _ch2="$_TIMED_KEY"
+            if [ "$_ch2" = "[" ]; then
+                IFS= read -rsn1 _ch3 </dev/tty
+                case "$_ch3" in
+                    A|B) ;;  # Up/Down — ignore for text input
+                    C)  # Right arrow
+                        if [ "$_cur" -lt "${#_buf}" ]; then
+                            _cur=$((_cur + 1))
+                            printf "\033[C" >/dev/tty
+                        fi
+                        ;;
+                    D)  # Left arrow
+                        if [ "$_cur" -gt 0 ]; then
+                            _cur=$((_cur - 1))
+                            printf "\033[D" >/dev/tty
+                        fi
+                        ;;
+                    H)  # Home
+                        _cur=0
+                        _ri_redraw
+                        ;;
+                    F)  # End
+                        _cur=${#_buf}
+                        _ri_redraw
+                        ;;
+                    3)  # Delete key (sends \x1b[3~)
+                        IFS= read -rsn1 _ch4 </dev/tty 2>/dev/null || _ch4=""
+                        if [ "$_ch4" = "~" ] && [ "$_cur" -lt "${#_buf}" ]; then
+                            _buf="${_buf:0:_cur}${_buf:_cur+1}"
+                            _ri_redraw
+                        fi
+                        ;;
+                esac
+            elif [ -z "$_ch2" ]; then
+                # Bare Escape — go back
+                printf "\n" >/dev/tty
+                return 1
+            fi
+            continue
+        fi
+
+        # Backspace (0x7f or 0x08)
+        if [ "$_ch" = $'\x7f' ] || [ "$_ch" = $'\x08' ]; then
+            if [ "$_cur" -gt 0 ]; then
+                _buf="${_buf:0:_cur-1}${_buf:_cur}"
+                _cur=$((_cur - 1))
+                _ri_redraw
+            fi
+            continue
+        fi
+
+        # Ctrl-D — also go back (familiar shortcut)
+        if [ "$_ch" = $'\x04' ]; then
+            printf "\n" >/dev/tty
+            return 1
+        fi
+
+        # Ctrl-A — Home
+        if [ "$_ch" = $'\x01' ]; then
+            _cur=0
+            _ri_redraw
+            continue
+        fi
+
+        # Ctrl-E — End
+        if [ "$_ch" = $'\x05' ]; then
+            _cur=${#_buf}
+            _ri_redraw
+            continue
+        fi
+
+        # Ctrl-U — clear line
+        if [ "$_ch" = $'\x15' ]; then
+            _buf=""
+            _cur=0
+            _ri_redraw
+            continue
+        fi
+
+        # Ctrl-K — kill from cursor to end
+        if [ "$_ch" = $'\x0b' ]; then
+            _buf="${_buf:0:_cur}"
+            _ri_redraw
+            continue
+        fi
+
+        # Ctrl-C — exit the installer
+        if [ "$_ch" = $'\x03' ]; then
+            printf "\n" >/dev/tty
+            exit 130
+        fi
+
+        # Ignore other control characters
+        case "$_ch" in
+            $'\x00'|$'\x02'|$'\x06'|$'\x07'|$'\x09'|$'\x0c'|$'\x0e'|$'\x0f'|$'\x10'|$'\x11'|$'\x12'|$'\x13'|$'\x14'|$'\x16'|$'\x17'|$'\x18'|$'\x19'|$'\x1a'|$'\x1c'|$'\x1d'|$'\x1e'|$'\x1f')
+                continue
+                ;;
+        esac
+
+        # Regular printable character — insert at cursor position
+        _buf="${_buf:0:_cur}${_ch}${_buf:_cur}"
+        _cur=$((_cur + 1))
+        _ri_redraw
+    done
 }
 
 select_from_menu() {
@@ -155,9 +324,8 @@ select_from_menu() {
     SELECTED_INDEX=0
 
     # Flush any buffered stdin so stale keypresses don't auto-select an option.
-    # Use a tiny hardcoded timeout (NOT ESC_TIMEOUT) — we just need to drain what's
-    # already buffered.  On bash 3.2 where fractional timeouts fail, `read` returns
-    # non-zero immediately, which exits the loop instantly.  That's fine.
+    # On bash 3.2 where fractional timeouts fail, `read` returns non-zero
+    # immediately, which exits the loop instantly.  That's fine.
     while IFS= read -rsn1 -t 0.01 _junk </dev/tty 2>/dev/null; do :; done
 
     while :; do
@@ -195,6 +363,12 @@ select_from_menu() {
             return 0
         fi
 
+        # Handle Ctrl-C — exit the installer
+        if [ "$key" = $'\x03' ]; then
+            printf "\n" >/dev/tty
+            exit 130
+        fi
+
         # Handle Backspace key (go back)
         if [ "$key" = $'\x7f' ] || [ "$key" = $'\x08' ]; then
             printf "%s\n" "-1"
@@ -203,9 +377,7 @@ select_from_menu() {
 
         # Handle escape sequences (arrow keys) and bare Escape (go back)
         if [ "$key" = $'\x1b' ]; then
-            # Read next character with timeout to distinguish bare Escape from arrow keys.
-            # Arrow key sequences (\x1b[A) arrive instantly; bare Escape has no follow-up.
-            IFS= read -rsn1 -t "$ESC_TIMEOUT" key2 </dev/tty 2>/dev/null || key2=""
+            read_byte_with_short_timeout; key2="$_TIMED_KEY"
             if [ "$key2" = "[" ]; then
                 # Read arrow key identifier
                 IFS= read -rsn1 key3 </dev/tty
@@ -502,7 +674,8 @@ select_image_tag() {
 
     # Build menu from the tag list
     # shellcheck disable=SC2086
-    SELECTED_INDEX=$(select_from_menu "--header=Select version:" $MENU_TAGS) || true
+    _rc=0; SELECTED_INDEX=$(select_from_menu "--header=Select version:" $MENU_TAGS) || _rc=$?
+    [ "$_rc" -eq 130 ] && exit 130
 
     # Handle go-back
     if [ "$SELECTED_INDEX" = "-1" ]; then
@@ -523,10 +696,10 @@ select_image_tag() {
 create_instance() {
     # -----------------------------------------------------------
     # 2. Gather configuration from user (step-based wizard)
-    #    Ctrl-D on any step goes back to the previous step.
-    #    Ctrl-D on the first step aborts create_instance (returns 1).
+    #    Escape (or Ctrl-D) on any step goes back to the previous step.
+    #    Escape on the first step aborts create_instance (returns 1).
     # -----------------------------------------------------------
-    INSTALL_ROOT="$HOME/.agentzero"
+    INSTALL_ROOT="$HOME/.agent-zero"
 
     # Variables populated across wizard steps
     SELECTED_TAG=""
@@ -555,9 +728,8 @@ create_instance() {
                 clear
                 print_banner
                 echo ""
-                printf "${BOLD}What should this instance be called?${NC} (Ctrl-D to go back)\n"
-                printf "Leave empty to use default [%s]: " "$DEFAULT_NAME"
-                read_input || { WIZARD_STEP=1; continue; }
+                printf "${BOLD}What should this instance be called?${NC} (Esc to go back)\n"
+                read_input "$DEFAULT_NAME" || { WIZARD_STEP=1; continue; }
                 CONTAINER_NAME="${INPUT_VALUE:-$DEFAULT_NAME}"
 
                 if instance_name_taken "$CONTAINER_NAME"; then
@@ -576,9 +748,8 @@ create_instance() {
                 clear
                 print_banner
                 echo ""
-                printf "${BOLD}Where should Agent Zero store user data?${NC} (Ctrl-D to go back)\n"
-                printf "Leave empty to use default [%s]: " "$DEFAULT_DATA_DIR"
-                read_input || { WIZARD_STEP=2; continue; }
+                printf "${BOLD}Where should Agent Zero store user data?${NC} (Esc to go back)\n"
+                read_input "$DEFAULT_DATA_DIR" || { WIZARD_STEP=2; continue; }
                 DATA_DIR="${INPUT_VALUE:-$DEFAULT_DATA_DIR}"
                 case "$DATA_DIR" in
                     ~/*) DATA_DIR="$HOME/${DATA_DIR#~/}" ;;
@@ -593,9 +764,8 @@ create_instance() {
                 clear
                 print_banner
                 echo ""
-                printf "${BOLD}What port should Agent Zero Web UI run on?${NC} (Ctrl-D to go back)\n"
-                printf "Leave empty to use default [%s]: " "$DEFAULT_PORT"
-                read_input || { WIZARD_STEP=3; continue; }
+                printf "${BOLD}What port should Agent Zero Web UI run on?${NC} (Esc to go back)\n"
+                read_input "$DEFAULT_PORT" || { WIZARD_STEP=3; continue; }
                 PORT="${INPUT_VALUE:-$DEFAULT_PORT}"
                 case "$PORT" in
                     ''|*[!0-9]*)
@@ -611,9 +781,9 @@ create_instance() {
                 clear
                 print_banner
                 echo ""
-                printf "${BOLD}What login username should be used for the Web UI?${NC} (Ctrl-D to go back)\n"
-                printf "Leave empty for no authentication: "
-                read_input || { WIZARD_STEP=4; continue; }
+                printf "${BOLD}What login username should be used for the Web UI?${NC} (Esc to go back)\n"
+                printf "Leave empty for no authentication:\n"
+                read_input "" || { WIZARD_STEP=4; continue; }
                 AUTH_LOGIN="$INPUT_VALUE"
                 AUTH_PASSWORD=""
                 if [ -n "$AUTH_LOGIN" ]; then
@@ -628,9 +798,8 @@ create_instance() {
                 clear
                 print_banner
                 echo ""
-                printf "${BOLD}What password should be used?${NC} (Ctrl-D to go back)\n"
-                printf "Leave empty to use default [12345678]: "
-                read_input || { WIZARD_STEP=5; continue; }
+                printf "${BOLD}What password should be used?${NC} (Esc to go back)\n"
+                read_input "12345678" || { WIZARD_STEP=5; continue; }
                 AUTH_PASSWORD="${INPUT_VALUE:-12345678}"
                 print_info "Auth configured for user: $AUTH_LOGIN"
                 WIZARD_STEP=7  # Done gathering input
@@ -732,7 +901,7 @@ manage_instances() {
 
             # Handle escape sequences (arrow keys) and bare Escape (go back)
             if [ "$key" = $'\x1b' ]; then
-                IFS= read -rsn1 -t "$ESC_TIMEOUT" key2 </dev/tty 2>/dev/null || key2=""
+                read_byte_with_short_timeout; key2="$_TIMED_KEY"
                 if [ "$key2" = "[" ]; then
                     IFS= read -rsn1 key3 </dev/tty
                     case "$key3" in
@@ -790,7 +959,8 @@ manage_single_instance() {
         INSTANCE_HEADER="Selected: $SELECTED_NAME ($SELECTED_IMAGE, $SELECTED_STATUS)"
 
         if [ "$IS_RUNNING" -eq 1 ]; then
-            ACTION_INDEX=$(select_from_menu "--header=$INSTANCE_HEADER" "Open in browser" "Restart" "Stop" "Delete" "Back") || true
+            _rc=0; ACTION_INDEX=$(select_from_menu "--header=$INSTANCE_HEADER" "Open in browser" "Restart" "Stop" "Delete" "Back") || _rc=$?
+            [ "$_rc" -eq 130 ] && exit 130
             case "$ACTION_INDEX" in
                 -1) ACTION_KEY="back" ;;  # Escape/Backspace — go back
                 0) ACTION_KEY="open" ;;
@@ -801,7 +971,8 @@ manage_single_instance() {
                 *) ACTION_KEY="invalid" ;;
             esac
         else
-            ACTION_INDEX=$(select_from_menu "--header=$INSTANCE_HEADER" "Start" "Delete" "Back") || true
+            _rc=0; ACTION_INDEX=$(select_from_menu "--header=$INSTANCE_HEADER" "Start" "Delete" "Back") || _rc=$?
+            [ "$_rc" -eq 130 ] && exit 130
             case "$ACTION_INDEX" in
                 -1) ACTION_KEY="back" ;;  # Escape/Backspace — go back
                 0) ACTION_KEY="start" ;;
@@ -900,7 +1071,8 @@ main_menu_for_existing() {
 
         if [ "$MENU_COUNT" -gt 0 ]; then
             HEADER="Detected ${MENU_COUNT} Agent Zero container(s). What would you like to do?"
-            SELECTED_INDEX=$(select_from_menu "--header=$HEADER" "Install new instance" "Manage existing instances" "Exit") || true
+            _rc=0; SELECTED_INDEX=$(select_from_menu "--header=$HEADER" "Install new instance" "Manage existing instances" "Exit") || _rc=$?
+            [ "$_rc" -eq 130 ] && exit 130
 
             case "$SELECTED_INDEX" in
                 -1) exit 0 ;;    # Escape/Backspace — exit

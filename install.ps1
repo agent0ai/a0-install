@@ -100,7 +100,14 @@ function Find-FreePort {
 #   - Escape key to abort (returns $null)
 #   - Enter to submit (returns the entered text)
 function Read-InputWithEscape {
-    $buffer = ''
+    param(
+        [string]$Default = ''
+    )
+
+    $buffer = $Default
+    if ($buffer.Length -gt 0) {
+        Write-Host $buffer -NoNewline
+    }
 
     while ($true) {
         $keyInfo = [Console]::ReadKey($true)
@@ -577,7 +584,7 @@ function create_instance {
     #   Esc on any step goes back to the previous step.
     #   Esc on the first step aborts create_instance (returns $false).
     # -----------------------------------------------------------
-    $installRoot = Join-Path $script:HomeDir '.agentzero'
+    $installRoot = Join-Path $script:HomeDir '.agent-zero'
 
     # Variables populated across wizard steps
     $containerName = ''
@@ -610,8 +617,8 @@ function create_instance {
                 Write-Host ''
                 Write-Host 'What should this instance be called?' -ForegroundColor White -NoNewline
                 Write-Host ' (Esc to go back)'
-                Write-Host "Leave empty to use default [$defaultName]: " -NoNewline
-                $containerName = Read-InputWithEscape
+                Write-Host '> ' -NoNewline
+                $containerName = Read-InputWithEscape -Default $defaultName
                 if ($null -eq $containerName) { $wizardStep = 1; continue }
                 if ([string]::IsNullOrWhiteSpace($containerName)) {
                     $containerName = $defaultName
@@ -636,8 +643,8 @@ function create_instance {
                 Write-Host ''
                 Write-Host 'Where should Agent Zero store user data?' -ForegroundColor White -NoNewline
                 Write-Host ' (Esc to go back)'
-                Write-Host "Leave empty to use default [$defaultDataDir]: " -NoNewline
-                $dataDir = Read-InputWithEscape
+                Write-Host '> ' -NoNewline
+                $dataDir = Read-InputWithEscape -Default $defaultDataDir
                 if ($null -eq $dataDir) { $wizardStep = 2; continue }
                 if ([string]::IsNullOrWhiteSpace($dataDir)) {
                     $dataDir = $defaultDataDir
@@ -655,8 +662,8 @@ function create_instance {
                 Write-Host ''
                 Write-Host 'What port should Agent Zero Web UI run on?' -ForegroundColor White -NoNewline
                 Write-Host ' (Esc to go back)'
-                Write-Host "Leave empty to use default [$defaultPort]: " -NoNewline
-                $port = Read-InputWithEscape
+                Write-Host '> ' -NoNewline
+                $port = Read-InputWithEscape -Default "$defaultPort"
                 if ($null -eq $port) { $wizardStep = 3; continue }
                 if ([string]::IsNullOrWhiteSpace($port)) {
                     $port = "$defaultPort"
@@ -696,8 +703,8 @@ function create_instance {
                 Write-Host ''
                 Write-Host 'What password should be used?' -ForegroundColor White -NoNewline
                 Write-Host ' (Esc to go back)'
-                Write-Host 'Leave empty to use default [12345678]: ' -NoNewline
-                $authPassword = Read-InputWithEscape
+                Write-Host '> ' -NoNewline
+                $authPassword = Read-InputWithEscape -Default '12345678'
                 if ($null -eq $authPassword) { $wizardStep = 5; continue }
                 if ([string]::IsNullOrWhiteSpace($authPassword)) {
                     $authPassword = '12345678'
