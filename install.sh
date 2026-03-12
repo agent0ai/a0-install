@@ -556,7 +556,7 @@ create_instance() {
                 print_banner
                 echo ""
                 printf "${BOLD}What should this instance be called?${NC} (Ctrl-D to go back)\n"
-                printf "Leave empty to use default [%s]: " "$DEFAULT_NAME"
+                printf "Leave empty to use default [%s]:\n" "$DEFAULT_NAME"
                 read_input || { WIZARD_STEP=1; continue; }
                 CONTAINER_NAME="${INPUT_VALUE:-$DEFAULT_NAME}"
 
@@ -577,7 +577,7 @@ create_instance() {
                 print_banner
                 echo ""
                 printf "${BOLD}Where should Agent Zero store user data?${NC} (Ctrl-D to go back)\n"
-                printf "Leave empty to use default [%s]: " "$DEFAULT_DATA_DIR"
+                printf "Leave empty to use default [%s]:\n" "$DEFAULT_DATA_DIR"
                 read_input || { WIZARD_STEP=2; continue; }
                 DATA_DIR="${INPUT_VALUE:-$DEFAULT_DATA_DIR}"
                 case "$DATA_DIR" in
@@ -594,7 +594,7 @@ create_instance() {
                 print_banner
                 echo ""
                 printf "${BOLD}What port should Agent Zero Web UI run on?${NC} (Ctrl-D to go back)\n"
-                printf "Leave empty to use default [%s]: " "$DEFAULT_PORT"
+                printf "Leave empty to use default [%s]:\n" "$DEFAULT_PORT"
                 read_input || { WIZARD_STEP=3; continue; }
                 PORT="${INPUT_VALUE:-$DEFAULT_PORT}"
                 case "$PORT" in
@@ -612,7 +612,7 @@ create_instance() {
                 print_banner
                 echo ""
                 printf "${BOLD}What login username should be used for the Web UI?${NC} (Ctrl-D to go back)\n"
-                printf "Leave empty for no authentication: "
+                printf "Leave empty for no authentication:\n"
                 read_input || { WIZARD_STEP=4; continue; }
                 AUTH_LOGIN="$INPUT_VALUE"
                 AUTH_PASSWORD=""
@@ -629,7 +629,7 @@ create_instance() {
                 print_banner
                 echo ""
                 printf "${BOLD}What password should be used?${NC} (Ctrl-D to go back)\n"
-                printf "Leave empty to use default [12345678]: "
+                printf "Leave empty to use default [12345678]:\n"
                 read_input || { WIZARD_STEP=5; continue; }
                 AUTH_PASSWORD="${INPUT_VALUE:-12345678}"
                 print_info "Auth configured for user: $AUTH_LOGIN"
