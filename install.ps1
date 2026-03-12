@@ -224,8 +224,15 @@ function select_from_menu {
 }
 
 function check_docker_daemon_running {
-    & docker info *> $null
-    return ($LASTEXITCODE -eq 0)
+    try {
+        & docker info *> $null 2>&1
+        return ($LASTEXITCODE -eq 0)
+    }
+    catch {
+        # NativeCommandError thrown under $ErrorActionPreference = 'Stop'
+        # means docker exited with non-zero / daemon not running.
+        return $false
+    }
 }
 
 function start_docker_daemon {
@@ -313,15 +320,27 @@ function check_docker {
 
     if (-not (check_docker_daemon_running)) {
         print_warn "Docker daemon is not running"
-        if (start_docker_daemon) {
-            if (-not (wait_for_docker_daemon)) {
-                print_error "Failed to start Docker daemon. Please start Docker manually and try again."
-                exit 1
+        # Try to auto-start Docker Desktop first
+        $autoStarted = start_docker_daemon
+        if ($autoStarted) {
+            if (wait_for_docker_daemon) {
+                return
             }
         }
-        else {
-            print_error "Please start Docker manually and try again."
-            exit 1
+
+        # Auto-start failed or timed out — show interactive retry menu
+        while ($true) {
+            $idx = select_from_menu -Header 'Docker is not running. Please start Docker Desktop and try again.' `
+                -Options @('Try again', 'Exit')
+
+            if ($idx -eq -1 -or $idx -eq 1) {
+                exit 0
+            }
+
+            if (check_docker_daemon_running) {
+                print_ok 'Docker daemon is running'
+                break
+            }
         }
     }
     else {
