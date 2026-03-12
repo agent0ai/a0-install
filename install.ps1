@@ -584,7 +584,7 @@ function create_instance {
     #   Esc on any step goes back to the previous step.
     #   Esc on the first step aborts create_instance (returns $false).
     # -----------------------------------------------------------
-    $installRoot = Join-Path $script:HomeDir '.agentzero'
+    $installRoot = Join-Path $script:HomeDir '.agent-zero'
 
     # Variables populated across wizard steps
     $containerName = ''
