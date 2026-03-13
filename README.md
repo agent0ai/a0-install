@@ -71,7 +71,7 @@ When you create a new instance, the installer will prompt you for:
 
 - **Version tag** (from Docker Hub tags, defaults to `latest`)
 - **Instance/container name** (default: `agent-zero`, or `agent-zero-2`, ...)
-- **Data directory** (default: `~/.agentzero/<instance>/usr`)
+- **Data directory** (default: `~/agent-zero/<instance>/usr`)
 - **Web UI port** (default: first free port starting at `5080`)
 - Optional **basic auth** (username; password defaults to `12345678`)
 
@@ -86,11 +86,11 @@ Then it:
 
 The installer creates a per-instance directory:
 
-- `~/.agentzero/<instance>/docker-compose.yml`
+- `~/agent-zero/<instance>/docker-compose.yml`
 
 And mounts your data directory into the container:
 
-- Host: `~/.agentzero/<instance>/usr` (by default)
+- Host: `~/agent-zero/<instance>/usr` (by default)
 - Container: `/a0/usr`
 
 ## Managing instances
@@ -120,7 +120,7 @@ docker rm -f <container_name>
 Then optionally remove the local files:
 
 ```bash
-rm -rf ~/.agentzero
+rm -rf ~/agent-zero
 ```
 
 ## Security note about one-liners

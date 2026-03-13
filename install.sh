@@ -743,7 +743,7 @@ create_instance() {
     #    Escape (or Ctrl-D) on any step goes back to the previous step.
     #    Escape on the first step aborts create_instance (returns 1).
     # -----------------------------------------------------------
-    INSTALL_ROOT="$HOME/.agent-zero"
+    INSTALL_ROOT="$HOME/agent-zero"
 
     # Variables populated across wizard steps
     SELECTED_TAG=""
