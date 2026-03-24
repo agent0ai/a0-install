@@ -106,13 +106,8 @@ is_port_in_use() {
 
     # Check Docker-published ports (covers stopped containers with port reservations too)
     DOCKER_PORTS="$(docker ps -a --format '{{.Ports}}' 2>/dev/null || true)"
-    if [ -n "$DOCKER_PORTS" ]; then
-        if printf "%s\n" "$DOCKER_PORTS" | grep -qE "(^|[ ,])0\.0\.0\.0:${CHECK_PORT}->" 2>/dev/null; then
-            return 0
-        fi
-        if printf "%s\n" "$DOCKER_PORTS" | grep -qE "(^|[ ,]):::${CHECK_PORT}->" 2>/dev/null; then
-            return 0
-        fi
+    if printf "%s\n" "$DOCKER_PORTS" | grep -qE ":${CHECK_PORT}->" 2>/dev/null; then
+        return 0
     fi
 
     # System-level check via lsof (macOS + Linux)
@@ -756,15 +751,40 @@ create_instance() {
     # Compute defaults once up front
     DEFAULT_PORT="$(find_free_port 5080)"
     DEFAULT_NAME="$(suggest_next_instance_name "agent-zero")"
-
-    WIZARD_STEP=1
-    while [ "$WIZARD_STEP" -ge 1 ] && [ "$WIZARD_STEP" -le 6 ]; do
+    QUICK_START=0
+    WIZARD_STEP=0
+    while [ "$WIZARD_STEP" -ge 0 ] && [ "$WIZARD_STEP" -le 6 ]; do
         case "$WIZARD_STEP" in
+            0)  # Quick Start vs Manual mode selection
+                _rc=0
+                SELECTED_INDEX=$(select_from_menu \
+                    "--header=How would you like to install Agent Zero?" \
+                    "Quick Start" \
+                    "Manual (Advanced Configuration)") || _rc=$?
+                [ "$_rc" -eq 130 ] && exit 130
+                if [ "$SELECTED_INDEX" = "-1" ]; then
+                    return 1  # Esc on first step — abort
+                fi
+                if [ "$SELECTED_INDEX" = "0" ]; then
+                    # Quick Start: use all defaults, skip to auth
+                    QUICK_START=1
+                    SELECTED_TAG="latest"
+                    CONTAINER_NAME="$DEFAULT_NAME"
+                    INSTANCE_DIR="$INSTALL_ROOT/$CONTAINER_NAME"
+                    DATA_DIR="$INSTANCE_DIR/usr"
+                    PORT="$DEFAULT_PORT"
+                    mkdir -p "$DATA_DIR"
+                    WIZARD_STEP=5
+                else
+                    WIZARD_STEP=1
+                fi
+                ;;
+
             1)  # Tag / version selection (uses its own full-screen menu)
                 if select_image_tag; then
                     WIZARD_STEP=2
                 else
-                    return 1  # Esc on first step — abort
+                    WIZARD_STEP=0; continue  # Esc — back to mode selection
                 fi
                 ;;
 
@@ -825,9 +845,17 @@ create_instance() {
                 clear
                 print_banner
                 echo ""
+                if [ "$QUICK_START" = "1" ]; then
+                    print_info "Quick Start selected. Using defaults:"
+                    print_ok "Version:   latest"
+                    print_ok "Instance:  $CONTAINER_NAME"
+                    print_ok "Port:      $PORT"
+                    print_ok "Data dir:  $DATA_DIR"
+                    echo ""
+                fi
                 printf "${BOLD}What login username should be used for the Web UI?${NC} (Esc to go back)\n"
                 printf "Leave empty for no authentication:\n"
-                read_input "" || { WIZARD_STEP=4; continue; }
+                read_input "" || { [ "$QUICK_START" = "1" ] && WIZARD_STEP=0 || WIZARD_STEP=4; continue; }
                 AUTH_LOGIN="$INPUT_VALUE"
                 AUTH_PASSWORD=""
                 if [ -n "$AUTH_LOGIN" ]; then

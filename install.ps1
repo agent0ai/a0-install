@@ -56,7 +56,7 @@ function Is-PortInUse {
         $dockerPorts = & docker ps -a --format '{{.Ports}}' 2>$null
         if ($LASTEXITCODE -eq 0 -and $dockerPorts) {
             $portsText = ($dockerPorts | Out-String)
-            if ($portsText -match "(^|[\s,])0\.0\.0\.0:${Port}->" -or $portsText -match "(^|[\s,]):::${Port}->") {
+            if ($portsText -match ":${Port}->") {
                 return $true
             }
         }
@@ -612,16 +612,44 @@ function create_instance {
     $defaultPort = Find-FreePort -BasePort 5080
     $defaultName = suggest_next_instance_name -BaseName 'agent-zero'
 
-    $wizardStep = 1
-    while ($wizardStep -ge 1 -and $wizardStep -le 6) {
+    $quickStart = $false
+    $wizardStep = 0
+    while ($wizardStep -ge 0 -and $wizardStep -le 6) {
         switch ($wizardStep) {
+            0 {
+                # Quick Start vs Manual mode selection
+                $modeIndex = select_from_menu `
+                    -Header 'How would you like to install Agent Zero?' `
+                    -Options @(
+                        "Quick Start",
+                        "Manual (Advanced Configuration)"
+                    )
+                if ($modeIndex -eq -1) {
+                    return $false  # Esc on first step — abort
+                }
+                if ($modeIndex -eq 0) {
+                    # Quick Start: use all defaults, skip to auth
+                    $quickStart = $true
+                    $script:SelectedTag = 'latest'
+                    $containerName = $defaultName
+                    $instanceDir = Join-Path $installRoot $containerName
+                    $dataDir = Join-Path $instanceDir 'usr'
+                    $port = "$defaultPort"
+                    New-Item -ItemType Directory -Force -Path $dataDir *> $null
+                    $wizardStep = 5
+                }
+                else {
+                    $wizardStep = 1
+                }
+            }
+
             1 {
                 # Tag / version selection (uses its own full-screen menu)
                 if (select_image_tag) {
                     $wizardStep = 2
                 }
                 else {
-                    return $false  # Esc on first step - abort
+                    $wizardStep = 0; continue  # Esc — back to mode selection
                 }
             }
 
@@ -696,11 +724,19 @@ function create_instance {
                 Clear-Host
                 Show-Banner
                 Write-Host ''
+                if ($quickStart) {
+                    print_info 'Quick Start selected. Using defaults:'
+                    print_ok "Version:   latest"
+                    print_ok "Instance:  $containerName"
+                    print_ok "Port:      $port"
+                    print_ok "Data dir:  $dataDir"
+                    Write-Host ''
+                }
                 Write-Host 'What login username should be used for the Web UI?' -ForegroundColor White -NoNewline
                 Write-Host ' (Esc to go back)'
                 Write-Host 'Leave empty for no authentication: ' -NoNewline
                 $authLogin = Read-InputWithEscape
-                if ($null -eq $authLogin) { $wizardStep = 4; continue }
+                if ($null -eq $authLogin) { if ($quickStart) { $wizardStep = 0 } else { $wizardStep = 4 }; continue }
                 $authPassword = ''
                 if (-not [string]::IsNullOrWhiteSpace($authLogin)) {
                     $wizardStep = 6
