@@ -230,6 +230,219 @@ function select_from_menu {
     }
 }
 
+function prompt_yes_no {
+    param(
+        [string]$Header
+    )
+
+    $selectedIndex = select_from_menu -Header $Header -Options @('Yes', 'No')
+    if ($selectedIndex -eq -1) {
+        return 1
+    }
+
+    if ($selectedIndex -eq 0) {
+        return 0
+    }
+
+    return 2
+}
+
+function Get-ConfigPropertyValue {
+    param(
+        [object]$Object,
+        [string]$Name,
+        [object]$Default = $null
+    )
+
+    if ($null -eq $Object) {
+        return $Default
+    }
+
+    if ($Object -is [System.Collections.IDictionary]) {
+        if ($Object.Contains($Name)) {
+            return $Object[$Name]
+        }
+        return $Default
+    }
+
+    $prop = $Object.PSObject.Properties[$Name]
+    if ($null -ne $prop) {
+        return $prop.Value
+    }
+
+    return $Default
+}
+
+function Get-BoolConfigValue {
+    param(
+        [object]$Value,
+        [bool]$Default = $false
+    )
+
+    if ($null -eq $Value) {
+        return $Default
+    }
+
+    if ($Value -is [bool]) {
+        return $Value
+    }
+
+    $text = ([string]$Value).Trim().ToLowerInvariant()
+    switch ($text) {
+        'true' { return $true }
+        '1' { return $true }
+        'false' { return $false }
+        '0' { return $false }
+        default { return $Default }
+    }
+}
+
+function Get-IntConfigValue {
+    param(
+        [object]$Value,
+        [int]$Default = 0
+    )
+
+    if ($null -eq $Value) {
+        return $Default
+    }
+
+    try {
+        return [int]$Value
+    }
+    catch {
+        return $Default
+    }
+}
+
+function ConvertTo-OrderedMap {
+    param(
+        [object]$InputObject
+    )
+
+    $map = [ordered]@{}
+
+    if ($null -eq $InputObject) {
+        return $map
+    }
+
+    if ($InputObject -is [System.Collections.IDictionary]) {
+        foreach ($key in $InputObject.Keys) {
+            $map[$key] = $InputObject[$key]
+        }
+        return $map
+    }
+
+    foreach ($prop in $InputObject.PSObject.Properties) {
+        $map[$prop.Name] = $prop.Value
+    }
+
+    return $map
+}
+
+function write_telegram_config {
+    param(
+        [string]$DataDir,
+        [string]$Token,
+        [string]$AllowedUser
+    )
+
+    $pluginDir = Join-Path $DataDir 'plugins\_telegram_integration'
+    $configFile = Join-Path $pluginDir 'config.json'
+    New-Item -ItemType Directory -Force -Path $pluginDir *> $null
+
+    $config = [ordered]@{}
+    if (Test-Path $configFile) {
+        try {
+            $loaded = Get-Content -Raw -Path $configFile | ConvertFrom-Json
+            $config = ConvertTo-OrderedMap -InputObject $loaded
+        }
+        catch {
+            $config = [ordered]@{}
+        }
+    }
+
+    $bots = @()
+    if ($config.Contains('bots') -and $null -ne $config['bots']) {
+        $bots = @($config['bots'])
+    }
+
+    $existingIndex = -1
+    $existingBot = $null
+    for ($i = 0; $i -lt $bots.Count; $i++) {
+        $candidateToken = [string](Get-ConfigPropertyValue -Object $bots[$i] -Name 'token' -Default '')
+        if ($candidateToken -eq $Token) {
+            $existingIndex = $i
+            $existingBot = $bots[$i]
+            break
+        }
+    }
+
+    if ($existingIndex -lt 0) {
+        $usedNames = @{}
+        foreach ($bot in $bots) {
+            $botName = [string](Get-ConfigPropertyValue -Object $bot -Name 'name' -Default '')
+            if (-not [string]::IsNullOrWhiteSpace($botName)) {
+                $usedNames[$botName] = $true
+            }
+        }
+
+        $nextIndex = 1
+        $botName = "bot_$nextIndex"
+        while ($usedNames.ContainsKey($botName)) {
+            $nextIndex++
+            $botName = "bot_$nextIndex"
+        }
+
+        $existingBot = [ordered]@{
+            name = $botName
+        }
+        $action = 'configured'
+    }
+    else {
+        $action = 'updated'
+    }
+
+    $botConfig = ConvertTo-OrderedMap -InputObject $existingBot
+    $botConfig['enabled'] = $true
+    $botConfig['notify_messages'] = Get-BoolConfigValue -Value (Get-ConfigPropertyValue -Object $existingBot -Name 'notify_messages' -Default $false)
+    $botConfig['token'] = $Token
+    $botConfig['mode'] = 'polling'
+    $botConfig['webhook_url'] = ''
+    $botConfig['webhook_secret'] = ''
+    $botConfig['allowed_users'] = @()
+    if (-not [string]::IsNullOrWhiteSpace($AllowedUser)) {
+        $botConfig['allowed_users'] = @($AllowedUser)
+    }
+    $botConfig['group_mode'] = 'mention'
+    $botConfig['welcome_enabled'] = Get-BoolConfigValue -Value (Get-ConfigPropertyValue -Object $existingBot -Name 'welcome_enabled' -Default $false)
+    $botConfig['welcome_message'] = [string](Get-ConfigPropertyValue -Object $existingBot -Name 'welcome_message' -Default '')
+    $userProjects = Get-ConfigPropertyValue -Object $existingBot -Name 'user_projects' -Default $null
+    if ($userProjects -is [System.Collections.IDictionary] -or $userProjects -is [pscustomobject]) {
+        $botConfig['user_projects'] = ConvertTo-OrderedMap -InputObject $userProjects
+    }
+    else {
+        $botConfig['user_projects'] = [ordered]@{}
+    }
+    $botConfig['default_project'] = [string](Get-ConfigPropertyValue -Object $existingBot -Name 'default_project' -Default '')
+    $botConfig['attachment_max_age_hours'] = Get-IntConfigValue -Value (Get-ConfigPropertyValue -Object $existingBot -Name 'attachment_max_age_hours' -Default 0)
+    $botConfig['agent_instructions'] = [string](Get-ConfigPropertyValue -Object $existingBot -Name 'agent_instructions' -Default '')
+
+    if ($existingIndex -lt 0) {
+        $bots += $botConfig
+    }
+    else {
+        $bots[$existingIndex] = $botConfig
+    }
+
+    $config['bots'] = @($bots)
+    $json = $config | ConvertTo-Json -Depth 20
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($configFile, $json + [Environment]::NewLine, $utf8NoBom)
+
+    print_ok "Telegram bot $action: $($botConfig['name'])"
+}
+
 function check_docker_daemon_running {
     try {
         & docker info *> $null 2>&1
@@ -607,6 +820,9 @@ function create_instance {
     $port = ''
     $authLogin = ''
     $authPassword = ''
+    $telegramSetup = $false
+    $telegramBotToken = ''
+    $telegramAllowedUser = ''
 
     # Compute defaults once up front
     $defaultPort = Find-FreePort -BasePort 5080
@@ -614,7 +830,7 @@ function create_instance {
 
     $quickStart = $false
     $wizardStep = 0
-    while ($wizardStep -ge 0 -and $wizardStep -le 6) {
+    while ($wizardStep -ge 0 -and $wizardStep -le 9) {
         switch ($wizardStep) {
             0 {
                 # Quick Start vs Manual mode selection
@@ -743,7 +959,7 @@ function create_instance {
                 }
                 else {
                     print_warn 'No authentication will be configured.'
-                    $wizardStep = 7  # Done gathering input
+                    $wizardStep = 7
                 }
             }
 
@@ -761,7 +977,68 @@ function create_instance {
                     $authPassword = '12345678'
                 }
                 print_info "Auth configured for user: $authLogin"
-                $wizardStep = 7  # Done gathering input
+                $wizardStep = 7
+            }
+
+            7 {
+                $telegramChoice = prompt_yes_no -Header 'Set up Telegram now?'
+                switch ($telegramChoice) {
+                    0 {
+                        $telegramSetup = $true
+                        $wizardStep = 8
+                    }
+                    1 {
+                        if (-not [string]::IsNullOrWhiteSpace($authLogin)) {
+                            $wizardStep = 6
+                        }
+                        else {
+                            $wizardStep = 5
+                        }
+                        continue
+                    }
+                    2 {
+                        $telegramSetup = $false
+                        $telegramBotToken = ''
+                        $telegramAllowedUser = ''
+                        $wizardStep = 10
+                    }
+                }
+            }
+
+            8 {
+                Clear-Host
+                Show-Banner
+                Write-Host ''
+                Write-Host 'Telegram bot token' -ForegroundColor White -NoNewline
+                Write-Host ' (Esc to go back)'
+                Write-Host '> ' -NoNewline
+                $telegramBotToken = Read-InputWithEscape -Default $telegramBotToken
+                if ($null -eq $telegramBotToken) { $wizardStep = 7; continue }
+                if ([string]::IsNullOrWhiteSpace($telegramBotToken)) {
+                    print_warn 'Telegram bot token cannot be empty.'
+                    Start-Sleep -Seconds 1
+                    continue
+                }
+                $wizardStep = 9
+            }
+
+            9 {
+                Clear-Host
+                Show-Banner
+                Write-Host ''
+                Write-Host 'Allowed Telegram user ID or @username' -ForegroundColor White -NoNewline
+                Write-Host ' (Esc to go back)'
+                Write-Host 'Leave empty to allow anyone to message the bot:'
+                Write-Host '> ' -NoNewline
+                $telegramAllowedUser = Read-InputWithEscape -Default $telegramAllowedUser
+                if ($null -eq $telegramAllowedUser) { $wizardStep = 8; continue }
+                if ([string]::IsNullOrWhiteSpace($telegramAllowedUser)) {
+                    print_warn 'Telegram bot will allow messages from any user.'
+                }
+                else {
+                    print_info "Telegram allow list set to: $telegramAllowedUser"
+                }
+                $wizardStep = 10
             }
         }
     }
@@ -772,6 +1049,10 @@ function create_instance {
 
     $instanceDir = Join-Path $installRoot $containerName
     New-Item -ItemType Directory -Force -Path $instanceDir *> $null
+
+    if ($telegramSetup) {
+        write_telegram_config -DataDir $dataDir -Token $telegramBotToken -AllowedUser $telegramAllowedUser
+    }
 
     $image = "agent0ai/agent-zero:$($script:SelectedTag)"
 
