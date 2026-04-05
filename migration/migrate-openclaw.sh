@@ -54,6 +54,90 @@ Options:
 EOF
 }
 
+expand_path_home() {
+    local value="${1:-}"
+    printf '%s' "${value/#\~/$HOME}"
+}
+
+find_openclaw_dir() {
+    local candidate
+
+    for candidate in "$HOME/.openclaw" "/opt/openclaw/.openclaw"; do
+        if [[ -d "${candidate}" ]]; then
+            printf '%s' "${candidate}"
+            return 0
+        fi
+    done
+
+    for candidate in /docker/openclaw-*/data/.openclaw; do
+        if [[ -d "${candidate}" ]]; then
+            printf '%s' "${candidate}"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+prompt_for_openclaw_dir() {
+    local candidate=""
+
+    if [[ ! -t 0 ]]; then
+        error "OpenClaw directory was not found in the common locations and no interactive terminal is available." >&2
+        error "Pass the .openclaw path explicitly: $0 [--include-auth-profiles] OPENCLAW_DIR [A0_USR_DIR]" >&2
+        exit 1
+    fi
+
+    while true; do
+        printf 'Enter the absolute path to your .openclaw folder: ' >&2
+        read -r candidate
+
+        if [[ -z "${candidate}" ]]; then
+            warn "Please enter an absolute path." >&2
+            continue
+        fi
+
+        candidate="$(expand_path_home "${candidate}")"
+
+        if [[ "${candidate}" != /* ]]; then
+            warn "The path must be absolute." >&2
+            continue
+        fi
+
+        if [[ ! -d "${candidate}" ]]; then
+            warn "Directory not found: ${candidate}" >&2
+            continue
+        fi
+
+        printf '%s' "${candidate}"
+        return 0
+    done
+}
+
+resolve_openclaw_dir() {
+    local explicit_dir="${1:-}"
+    local resolved=""
+
+    if [[ -n "${explicit_dir}" ]]; then
+        resolved="$(expand_path_home "${explicit_dir}")"
+        if [[ -d "${resolved}" ]]; then
+            printf '%s' "${resolved}"
+            return 0
+        fi
+
+        warn "OpenClaw directory not found at explicit path: ${resolved}" >&2
+        prompt_for_openclaw_dir
+        return 0
+    fi
+
+    if resolved="$(find_openclaw_dir)"; then
+        printf '%s' "${resolved}"
+        return 0
+    fi
+
+    prompt_for_openclaw_dir
+}
+
 MIGRATED=0
 SKIPPED=0
 WARNINGS=0
@@ -103,11 +187,10 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-OPENCLAW_DIR="${POSITIONAL_ARGS[0]:-$HOME/.openclaw}"
+OPENCLAW_DIR="$(resolve_openclaw_dir "${POSITIONAL_ARGS[0]:-}")"
 A0_USR_DIR="${POSITIONAL_ARGS[1]:-/a0/usr}"
 
-OPENCLAW_DIR="${OPENCLAW_DIR/#\~/$HOME}"
-A0_USR_DIR="${A0_USR_DIR/#\~/$HOME}"
+A0_USR_DIR="$(expand_path_home "${A0_USR_DIR}")"
 
 OPENCLAW_CONFIG="${OPENCLAW_DIR}/openclaw.json"
 OPENCLAW_ENV="${OPENCLAW_DIR}/.env"
