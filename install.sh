@@ -97,6 +97,124 @@ wait_for_keypress() {
     IFS= read -rsn1 _key </dev/tty
 }
 
+prompt_yes_no() {
+    local _header="$1"
+    local _rc=0
+    local _selected=""
+
+    _selected="$(select_from_menu "--header=${_header}" "Yes" "No")" || _rc=$?
+    [ "$_rc" -eq 130 ] && exit 130
+    if [ "$_rc" -ne 0 ] || [ "$_selected" = "-1" ]; then
+        return 1
+    fi
+
+    if [ "$_selected" = "0" ]; then
+        return 0
+    fi
+
+    return 2
+}
+
+write_telegram_config() {
+    local _data_dir="$1"
+    local _token="$2"
+    local _allowed_user="$3"
+    local _plugin_dir="${_data_dir}/plugins/_telegram_integration"
+    local _config_file="${_plugin_dir}/config.json"
+    local _result=""
+
+    mkdir -p "$_plugin_dir"
+
+    if ! command -v python3 >/dev/null 2>&1; then
+        print_error "Python 3 is required to write Telegram configuration."
+        exit 1
+    fi
+
+    _result="$(
+        TELEGRAM_CONFIG_FILE="$_config_file" \
+        TELEGRAM_BOT_TOKEN="$_token" \
+        TELEGRAM_ALLOWED_USER="$_allowed_user" \
+        python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+config_file = Path(os.environ["TELEGRAM_CONFIG_FILE"])
+token = os.environ["TELEGRAM_BOT_TOKEN"].strip()
+allowed_user = os.environ["TELEGRAM_ALLOWED_USER"].strip()
+
+config = {}
+if config_file.exists():
+    try:
+        loaded = json.loads(config_file.read_text())
+        if isinstance(loaded, dict):
+            config = loaded
+    except Exception:
+        config = {}
+
+bots = config.get("bots")
+if not isinstance(bots, list):
+    bots = []
+
+existing = None
+for bot in bots:
+    if isinstance(bot, dict) and bot.get("token") == token:
+        existing = bot
+        break
+
+if existing is None:
+    used_names = {
+        str(bot.get("name", "")).strip()
+        for bot in bots
+        if isinstance(bot, dict) and str(bot.get("name", "")).strip()
+    }
+    idx = 1
+    name = f"bot_{idx}"
+    while name in used_names:
+        idx += 1
+        name = f"bot_{idx}"
+    existing = {"name": name}
+    bots.append(existing)
+    action = "created"
+else:
+    action = "updated"
+
+existing.update({
+    "enabled": True,
+    "notify_messages": bool(existing.get("notify_messages", False)),
+    "token": token,
+    "mode": "polling",
+    "webhook_url": "",
+    "webhook_secret": "",
+    "allowed_users": [allowed_user] if allowed_user else [],
+    "group_mode": "mention",
+    "welcome_enabled": bool(existing.get("welcome_enabled", False)),
+    "welcome_message": existing.get("welcome_message", ""),
+    "user_projects": existing.get("user_projects", {}) if isinstance(existing.get("user_projects"), dict) else {},
+    "default_project": existing.get("default_project", ""),
+    "attachment_max_age_hours": int(existing.get("attachment_max_age_hours", 0) or 0),
+    "agent_instructions": existing.get("agent_instructions", ""),
+})
+
+config["bots"] = bots
+config_file.write_text(json.dumps(config, indent=2) + "\n")
+print(f"{action}:{existing['name']}")
+PY
+    )"
+
+    case "$_result" in
+        created:*)
+            print_ok "Telegram bot configured: ${_result#created:}"
+            ;;
+        updated:*)
+            print_ok "Telegram bot updated: ${_result#updated:}"
+            ;;
+        *)
+            print_warn "Telegram config written to $_config_file"
+            ;;
+    esac
+}
+
 # Check whether a TCP port is in use on localhost.
 # Uses a fallback chain: lsof → nc → /dev/tcp (for broad OS compatibility).
 # Also checks Docker container port mappings directly.
@@ -747,13 +865,16 @@ create_instance() {
     PORT=""
     AUTH_LOGIN=""
     AUTH_PASSWORD=""
+    TELEGRAM_SETUP=0
+    TELEGRAM_BOT_TOKEN=""
+    TELEGRAM_ALLOWED_USER=""
 
     # Compute defaults once up front
     DEFAULT_PORT="$(find_free_port 5080)"
     DEFAULT_NAME="$(suggest_next_instance_name "agent-zero")"
     QUICK_START=0
     WIZARD_STEP=0
-    while [ "$WIZARD_STEP" -ge 0 ] && [ "$WIZARD_STEP" -le 6 ]; do
+    while [ "$WIZARD_STEP" -ge 0 ] && [ "$WIZARD_STEP" -le 9 ]; do
         case "$WIZARD_STEP" in
             0)  # Quick Start vs Manual mode selection
                 _rc=0
@@ -874,7 +995,63 @@ create_instance() {
                 read_input "12345678" || { WIZARD_STEP=5; continue; }
                 AUTH_PASSWORD="${INPUT_VALUE:-12345678}"
                 print_info "Auth configured for user: $AUTH_LOGIN"
-                WIZARD_STEP=7  # Done gathering input
+                WIZARD_STEP=7
+                ;;
+
+            7)  # Telegram setup
+                _rc=0
+                prompt_yes_no "Set up Telegram now?" || _rc=$?
+                case "$_rc" in
+                    0)
+                        TELEGRAM_SETUP=1
+                        WIZARD_STEP=8
+                        ;;
+                    1)
+                        if [ -n "$AUTH_LOGIN" ]; then
+                            WIZARD_STEP=6
+                        else
+                            WIZARD_STEP=5
+                        fi
+                        continue
+                        ;;
+                    2)
+                        TELEGRAM_SETUP=0
+                        TELEGRAM_BOT_TOKEN=""
+                        TELEGRAM_ALLOWED_USER=""
+                        WIZARD_STEP=10
+                        ;;
+                esac
+                ;;
+
+            8)  # Telegram bot token
+                clear
+                print_banner
+                echo ""
+                printf "${BOLD}Telegram bot token${NC} (Esc to go back)\n"
+                read_input "$TELEGRAM_BOT_TOKEN" || { WIZARD_STEP=7; continue; }
+                TELEGRAM_BOT_TOKEN="${INPUT_VALUE}"
+                if [ -z "$TELEGRAM_BOT_TOKEN" ]; then
+                    print_warn "Telegram bot token cannot be empty."
+                    sleep 1
+                    continue
+                fi
+                WIZARD_STEP=9
+                ;;
+
+            9)  # Telegram allow list
+                clear
+                print_banner
+                echo ""
+                printf "${BOLD}Allowed Telegram user ID or @username${NC} (Esc to go back)\n"
+                printf "Leave empty to allow anyone to message the bot:\n"
+                read_input "$TELEGRAM_ALLOWED_USER" || { WIZARD_STEP=8; continue; }
+                TELEGRAM_ALLOWED_USER="${INPUT_VALUE}"
+                if [ -z "$TELEGRAM_ALLOWED_USER" ]; then
+                    print_warn "Telegram bot will allow messages from any user."
+                else
+                    print_info "Telegram allow list set to: $TELEGRAM_ALLOWED_USER"
+                fi
+                WIZARD_STEP=10
                 ;;
         esac
     done
@@ -887,6 +1064,10 @@ create_instance() {
     # 3. Pull image & start container
     # -----------------------------------------------------------
     mkdir -p "$INSTANCE_DIR"
+
+    if [ "$TELEGRAM_SETUP" = "1" ]; then
+        write_telegram_config "$DATA_DIR" "$TELEGRAM_BOT_TOKEN" "$TELEGRAM_ALLOWED_USER"
+    fi
 
     local IMAGE="agent0ai/agent-zero:$SELECTED_TAG"
 
