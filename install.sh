@@ -61,6 +61,9 @@ trap restore_tty EXIT
 trap 'restore_tty; exit 130' INT
 trap 'restore_tty; exit 143' TERM HUP
 
+DOCKER=(docker)
+DOCKER_SUDO_NOTICE_SHOWN=0
+
 # Read a single byte from /dev/tty with a short (~0.1s) timeout.
 # Used to disambiguate bare Escape from arrow-key escape sequences.
 # Sets _TIMED_KEY to the byte read, or "" on timeout. Returns 0 on
@@ -105,7 +108,7 @@ is_port_in_use() {
     CHECK_PORT="$1"
 
     # Check Docker-published ports (covers stopped containers with port reservations too)
-    DOCKER_PORTS="$(docker ps -a --format '{{.Ports}}' 2>/dev/null || true)"
+    DOCKER_PORTS="$("${DOCKER[@]}" ps -a --format '{{.Ports}}' 2>/dev/null || true)"
     if printf "%s\n" "$DOCKER_PORTS" | grep -qE ":${CHECK_PORT}->" 2>/dev/null; then
         return 0
     fi
@@ -399,12 +402,64 @@ select_from_menu() {
     done
 }
 
-check_docker_daemon_running() {
-    if docker info >/dev/null 2>&1; then
+DOCKER_INFO_STATUS=""
+DOCKER_INFO_OUTPUT=""
+
+probe_docker_info() {
+    DOCKER_INFO_STATUS="error"
+    DOCKER_INFO_OUTPUT="$("$@" info 2>&1 >/dev/null)" && {
+        DOCKER_INFO_STATUS="ok"
         return 0
-    else
-        return 1
+    }
+
+    case "$DOCKER_INFO_OUTPUT" in
+        *"permission denied"*|*"Permission denied"*|*"Got permission denied"*)
+            DOCKER_INFO_STATUS="permission"
+            ;;
+        *"Cannot connect to the Docker daemon"*|*"Is the docker daemon running"*|*"connection refused"*|*"Connection refused"*)
+            DOCKER_INFO_STATUS="daemon"
+            ;;
+        *"command not found"*|*"No such file or directory"*)
+            DOCKER_INFO_STATUS="missing"
+            ;;
+        *)
+            DOCKER_INFO_STATUS="error"
+            ;;
+    esac
+    return 1
+}
+
+configure_docker_access() {
+    if probe_docker_info docker; then
+        DOCKER=(docker)
+        return 0
     fi
+
+    case "$DOCKER_INFO_STATUS" in
+        permission)
+            if [ "$(id -u 2>/dev/null)" -ne 0 ] && command -v sudo >/dev/null 2>&1; then
+                if probe_docker_info sudo docker; then
+                    DOCKER=(sudo docker)
+                    if [ "$DOCKER_SUDO_NOTICE_SHOWN" -eq 0 ]; then
+                        print_warn "Using sudo for Docker commands in this run. Log out and back in later to use Docker without sudo."
+                        DOCKER_SUDO_NOTICE_SHOWN=1
+                    fi
+                    return 0
+                fi
+            fi
+            return 2
+            ;;
+        daemon|missing)
+            return 1
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+check_docker_daemon_running() {
+    configure_docker_access
 }
 
 start_docker_daemon() {
@@ -425,13 +480,13 @@ start_docker_daemon() {
             print_info "Starting Docker daemon..."
             # Try systemctl first
             if command -v systemctl >/dev/null 2>&1; then
-                if sudo systemctl start docker >/dev/null 2>&1; then
+                if run_as_root systemctl start docker >/dev/null 2>&1; then
                     return 0
                 fi
             fi
             # Fallback to service command
             if command -v service >/dev/null 2>&1; then
-                if sudo service docker start >/dev/null 2>&1; then
+                if run_as_root service docker start >/dev/null 2>&1; then
                     return 0
                 fi
             fi
@@ -451,9 +506,16 @@ wait_for_docker_daemon() {
 
     print_info "Waiting for Docker daemon to be ready..."
     while [ $WAITED -lt $MAX_WAIT ]; do
-        if docker info >/dev/null 2>&1; then
+        configure_docker_access
+        _docker_ready_rc=$?
+        if [ "$_docker_ready_rc" -eq 0 ]; then
             print_ok "Docker daemon is ready"
             return 0
+        fi
+        if [ "$_docker_ready_rc" -eq 2 ]; then
+            print_error "Docker is running, but your user cannot access it yet."
+            print_warn "Log out and back in once so your docker group membership is applied, then rerun this installer."
+            return 1
         fi
         sleep 1
         WAITED=$((WAITED + 1))
@@ -464,6 +526,95 @@ wait_for_docker_daemon() {
     return 1
 }
 
+run_as_root() {
+    if [ "$(id -u 2>/dev/null)" -eq 0 ]; then
+        "$@"
+    else
+        sudo "$@"
+    fi
+}
+
+run_root_script() {
+    if [ "$(id -u 2>/dev/null)" -eq 0 ]; then
+        sh -c "$1"
+    else
+        sudo sh -c "$1"
+    fi
+}
+
+safe_install_user() {
+    INSTALL_USER="${SUDO_USER:-${USER:-}}"
+    case "$INSTALL_USER" in
+        ""|*[!A-Za-z0-9_.-]*)
+            return 1
+            ;;
+        *)
+            printf "%s\n" "$INSTALL_USER"
+            return 0
+            ;;
+    esac
+}
+
+detect_linux_package_manager() {
+    for PM in apt-get dnf pacman zypper yast rpm; do
+        if command -v "$PM" >/dev/null 2>&1; then
+            printf "%s\n" "$PM"
+            return 0
+        fi
+    done
+    return 1
+}
+
+install_docker_on_linux() {
+    if ! command -v sudo >/dev/null 2>&1 && [ "$(id -u 2>/dev/null)" -ne 0 ]; then
+        print_error "sudo is required to install Docker Engine automatically."
+        return 1
+    fi
+
+    PM="$(detect_linux_package_manager || true)"
+    case "$PM" in
+        apt-get)
+            INSTALL_SCRIPT='apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io'
+            ;;
+        dnf)
+            INSTALL_SCRIPT='dnf install -y moby-engine || dnf install -y docker'
+            ;;
+        pacman)
+            INSTALL_SCRIPT='pacman -Sy --noconfirm docker'
+            ;;
+        zypper)
+            INSTALL_SCRIPT='zypper --non-interactive install docker'
+            ;;
+        yast|rpm)
+            print_error "Automatic Docker dependency resolution is not available for ${PM}."
+            print_info "Install these packages, then rerun this installer: docker containerd runc iptables docker-cli"
+            return 1
+            ;;
+        *)
+            print_error "No supported Linux package manager was found."
+            print_info "Install Docker Engine manually, then rerun this installer."
+            return 1
+            ;;
+    esac
+
+    print_info "Installing Docker Engine with ${PM}..."
+    run_root_script "$INSTALL_SCRIPT"
+
+    print_info "Starting Docker daemon..."
+    if command -v systemctl >/dev/null 2>&1; then
+        run_as_root systemctl enable --now docker
+    elif command -v service >/dev/null 2>&1; then
+        run_as_root service docker start
+    fi
+
+    INSTALL_USER="$(safe_install_user || true)"
+    if [ -n "$INSTALL_USER" ] && [ "$(id -u 2>/dev/null)" -ne 0 ]; then
+        print_info "Adding ${INSTALL_USER} to the docker group..."
+        run_root_script "if getent group docker >/dev/null 2>&1; then usermod -aG docker '${INSTALL_USER}'; fi"
+        print_warn "Your next login session will use Docker without sudo."
+    fi
+}
+
 check_docker() {
     # -----------------------------------------------------------
     # 1. Ensure Docker is installed
@@ -471,20 +622,35 @@ check_docker() {
     if command -v docker > /dev/null 2>&1; then
         print_ok "Docker already installed"
     else
-        print_warn "Docker not found. Installing via https://get.docker.com ..."
-        curl -fsSL https://get.docker.com | sh
-
-        if [ "$(uname -s 2>/dev/null)" = "Linux" ] && [ "$(id -u 2>/dev/null)" -ne 0 ]; then
-            print_info "Adding current user to the docker group..."
-            sudo usermod -aG docker "$USER"
-            print_warn "You may need to log out and back in for group changes to take effect."
-        fi
+        OS_NAME="$(uname -s 2>/dev/null || true)"
+        case "$OS_NAME" in
+            Linux)
+                print_warn "Docker not found. Installing Docker Engine..."
+                install_docker_on_linux || exit 1
+                ;;
+            Darwin)
+                print_error "Docker is not installed. Install Docker Desktop, start it, then rerun this installer."
+                exit 1
+                ;;
+            *)
+                print_error "Docker is not installed. Install Docker Engine or Docker Desktop, then rerun this installer."
+                exit 1
+                ;;
+        esac
     fi
 
     # -----------------------------------------------------------
     # 2. Ensure Docker daemon is running
     # -----------------------------------------------------------
-    if ! check_docker_daemon_running; then
+    check_docker_daemon_running
+    DOCKER_READY_RC=$?
+    if [ "$DOCKER_READY_RC" -eq 2 ]; then
+        print_error "Docker is installed, but your user cannot access it yet."
+        print_warn "Log out and back in once so your docker group membership is applied, then rerun this installer."
+        exit 1
+    fi
+
+    if [ "$DOCKER_READY_RC" -ne 0 ]; then
         print_warn "Docker daemon is not running"
         if start_docker_daemon; then
             if ! wait_for_docker_daemon; then
@@ -533,15 +699,15 @@ list_agent_zero_containers() {
 
     # --- Pass 1: labeled containers (fast, single docker command) ---
     local _labeled
-    _labeled="$(docker ps -a --filter "label=ai.agent0.managed=true" \
+    _labeled="$("${DOCKER[@]}" ps -a --filter "label=ai.agent0.managed=true" \
         --format '{{.Names}}' 2>/dev/null || true)"
 
     local _name _cfg_image _status
     if [ -n "$_labeled" ]; then
         while IFS= read -r _name; do
             [ -z "$_name" ] && continue
-            _cfg_image="$(docker inspect --format '{{.Config.Image}}' "$_name" 2>/dev/null || true)"
-            _status="$(docker ps -a --filter "name=^/${_name}$" --format '{{.Status}}' 2>/dev/null | head -n 1)"
+            _cfg_image="$("${DOCKER[@]}" inspect --format '{{.Config.Image}}' "$_name" 2>/dev/null || true)"
+            _status="$("${DOCKER[@]}" ps -a --filter "name=^/${_name}$" --format '{{.Status}}' 2>/dev/null | head -n 1)"
             printf '%s|%s|%s\n' "$_name" "$_cfg_image" "$_status"
             _seen="${_seen}${_name}|"
         done <<< "$_labeled"
@@ -549,18 +715,18 @@ list_agent_zero_containers() {
 
     # --- Pass 2: unlabeled containers whose Config.Image matches (legacy) ---
     local _all_names
-    _all_names="$(docker ps -a --format '{{.Names}}' 2>/dev/null || true)"
+    _all_names="$("${DOCKER[@]}" ps -a --format '{{.Names}}' 2>/dev/null || true)"
     if [ -n "$_all_names" ]; then
         while IFS= read -r _name; do
             [ -z "$_name" ] && continue
             # Skip if already found in pass 1
             case "$_seen" in *"${_name}|"*) continue ;; esac
-            _cfg_image="$(docker inspect --format '{{.Config.Image}}' "$_name" 2>/dev/null || true)"
+            _cfg_image="$("${DOCKER[@]}" inspect --format '{{.Config.Image}}' "$_name" 2>/dev/null || true)"
             case "$_cfg_image" in
                 agent0ai/agent-zero*) ;;
                 *) continue ;;
             esac
-            _status="$(docker ps -a --filter "name=^/${_name}$" --format '{{.Status}}' 2>/dev/null | head -n 1)"
+            _status="$("${DOCKER[@]}" ps -a --filter "name=^/${_name}$" --format '{{.Status}}' 2>/dev/null | head -n 1)"
             printf '%s|%s|%s\n' "$_name" "$_cfg_image" "$_status"
         done <<< "$_all_names"
     fi
@@ -573,7 +739,7 @@ count_existing_agent_zero_containers() {
 instance_name_taken() {
     NAME_TO_CHECK="$1"
 
-    if docker ps -a --format '{{.Names}}' 2>/dev/null | awk -v target="$NAME_TO_CHECK" '$0 == target {found=1} END {exit found ? 0 : 1}'; then
+    if "${DOCKER[@]}" ps -a --format '{{.Names}}' 2>/dev/null | awk -v target="$NAME_TO_CHECK" '$0 == target {found=1} END {exit found ? 0 : 1}'; then
         return 0
     fi
 
@@ -891,7 +1057,7 @@ create_instance() {
     local IMAGE="agent0ai/agent-zero:$SELECTED_TAG"
 
     print_info "Pulling Agent Zero image (this may take a moment)..."
-    docker pull --quiet "$IMAGE"
+    "${DOCKER[@]}" pull --quiet "$IMAGE"
 
     print_info "Starting Agent Zero..."
     local DOCKER_RUN_ARGS=(
@@ -905,7 +1071,7 @@ create_instance() {
     if [ -n "$AUTH_LOGIN" ]; then
         DOCKER_RUN_ARGS+=(-e "AUTH_LOGIN=${AUTH_LOGIN}" -e "AUTH_PASSWORD=${AUTH_PASSWORD}")
     fi
-    docker run "${DOCKER_RUN_ARGS[@]}" "$IMAGE"
+    "${DOCKER[@]}" run "${DOCKER_RUN_ARGS[@]}" "$IMAGE"
 
     # -----------------------------------------------------------
     # 4. Wait for the service to become ready
@@ -1014,10 +1180,10 @@ manage_single_instance() {
     SELECTED_NAME="$1"
 
     # Look up the image for display (Config.Image preserves the original tag even when the image is untagged)
-    SELECTED_IMAGE="$(docker inspect --format '{{.Config.Image}}' "$SELECTED_NAME" 2>/dev/null || true)"
+    SELECTED_IMAGE="$("${DOCKER[@]}" inspect --format '{{.Config.Image}}' "$SELECTED_NAME" 2>/dev/null || true)"
 
     while :; do
-        SELECTED_STATUS="$(docker ps -a --filter "name=^/${SELECTED_NAME}$" --format '{{.Status}}' 2>/dev/null | head -n 1)"
+        SELECTED_STATUS="$("${DOCKER[@]}" ps -a --filter "name=^/${SELECTED_NAME}$" --format '{{.Status}}' 2>/dev/null | head -n 1)"
 
         # If container no longer exists (e.g. after delete), return
         if [ -z "$SELECTED_STATUS" ]; then
@@ -1057,7 +1223,7 @@ manage_single_instance() {
 
         case "$ACTION_KEY" in
             open)
-                PORT_OUTPUT="$(docker port "$SELECTED_NAME" 80/tcp 2>/dev/null || true)"
+                PORT_OUTPUT="$("${DOCKER[@]}" port "$SELECTED_NAME" 80/tcp 2>/dev/null || true)"
                 HOST_PORT="$(printf "%s\n" "$PORT_OUTPUT" | sed -n 's/.*:\([0-9][0-9]*\)$/\1/p' | head -n 1)"
 
                 if [ -z "$HOST_PORT" ]; then
@@ -1071,8 +1237,8 @@ manage_single_instance() {
                 ;;
             start)
                 print_info "Starting '$SELECTED_NAME'..."
-                START_OUTPUT="$(docker start "$SELECTED_NAME" 2>&1)" || true
-                if docker ps --filter "name=^/${SELECTED_NAME}$" --filter "status=running" --format '{{.Names}}' 2>/dev/null | grep -q "^${SELECTED_NAME}$"; then
+                START_OUTPUT="$("${DOCKER[@]}" start "$SELECTED_NAME" 2>&1)" || true
+                if "${DOCKER[@]}" ps --filter "name=^/${SELECTED_NAME}$" --filter "status=running" --format '{{.Names}}' 2>/dev/null | grep -q "^${SELECTED_NAME}$"; then
                     print_ok "Started '$SELECTED_NAME'."
                 else
                     print_error "Failed to start '$SELECTED_NAME'."
@@ -1084,7 +1250,7 @@ manage_single_instance() {
                 ;;
             stop)
                 print_info "Stopping '$SELECTED_NAME'..."
-                if docker stop "$SELECTED_NAME" >/dev/null 2>&1; then
+                if "${DOCKER[@]}" stop "$SELECTED_NAME" >/dev/null 2>&1; then
                     print_ok "Stopped '$SELECTED_NAME'."
                 else
                     print_error "Failed to stop '$SELECTED_NAME'."
@@ -1093,8 +1259,8 @@ manage_single_instance() {
                 ;;
             restart)
                 print_info "Restarting '$SELECTED_NAME'..."
-                RESTART_OUTPUT="$(docker restart "$SELECTED_NAME" 2>&1)" || true
-                if docker ps --filter "name=^/${SELECTED_NAME}$" --filter "status=running" --format '{{.Names}}' 2>/dev/null | grep -q "^${SELECTED_NAME}$"; then
+                RESTART_OUTPUT="$("${DOCKER[@]}" restart "$SELECTED_NAME" 2>&1)" || true
+                if "${DOCKER[@]}" ps --filter "name=^/${SELECTED_NAME}$" --filter "status=running" --format '{{.Names}}' 2>/dev/null | grep -q "^${SELECTED_NAME}$"; then
                     print_ok "Restarted '$SELECTED_NAME'."
                 else
                     print_error "Failed to restart '$SELECTED_NAME'."
@@ -1110,8 +1276,8 @@ manage_single_instance() {
                 printf "\n"
                 if [ "$CONFIRM" = "y" ] || [ "$CONFIRM" = "Y" ]; then
                     # Stop first if running
-                    docker stop "$SELECTED_NAME" >/dev/null 2>&1 || true
-                    if docker rm "$SELECTED_NAME" >/dev/null 2>&1; then
+                    "${DOCKER[@]}" stop "$SELECTED_NAME" >/dev/null 2>&1 || true
+                    if "${DOCKER[@]}" rm "$SELECTED_NAME" >/dev/null 2>&1; then
                         print_ok "Deleted '$SELECTED_NAME'."
                     else
                         print_error "Failed to delete '$SELECTED_NAME'."

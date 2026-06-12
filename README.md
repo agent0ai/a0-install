@@ -45,13 +45,12 @@ pwsh -File .\install.ps1
 
 ## Prerequisites
 
-- **Docker Engine / Docker Desktop**
-- **Docker Compose plugin** (`docker compose`)
+- **Docker Engine / Docker Desktop** with a running daemon
 
 Notes:
 
 - On **macOS**, the script can open Docker Desktop for you, but you still need it installed.
-- On **Linux**, `install.sh` will attempt to install Docker via `https://get.docker.com` if `docker` is not found.
+- On **Linux**, `install.sh` can install Docker Engine through the detected package manager. Debian/Ubuntu use `apt-get install docker.io`.
 - On **Windows**, `install.ps1` will not install Docker automatically; it will direct you to install Docker Desktop.
 
 ## What the installer does
