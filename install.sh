@@ -993,7 +993,7 @@ check_docker() {
 
 wait_for_ready() {
     URL="$1"
-    MAX_WAIT=60
+    MAX_WAIT=300
     WAITED=0
 
     printf "${GREEN}[INFO]${NC} Launching Agent Zero..."
@@ -1155,13 +1155,52 @@ for item in payload.get("results", []):
     printf "%s\n" "$PARSED_TAGS"
 }
 
+fetch_latest_semver_release_tag() {
+    RELEASES_URL="https://api.github.com/repos/agent0ai/agent-zero/releases?per_page=100"
+    RAW_RELEASES_JSON="$(curl -fsSL "$RELEASES_URL" 2>/dev/null || true)"
+
+    if [ -z "$RAW_RELEASES_JSON" ]; then
+        return 1
+    fi
+
+    if command -v python3 >/dev/null 2>&1; then
+        printf "%s" "$RAW_RELEASES_JSON" | python3 -c 'import json,re,sys
+try:
+    payload=json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+for item in payload:
+    tag=item.get("tag_name") or ""
+    if item.get("draft") or item.get("prerelease"):
+        continue
+    if re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+", tag):
+        print(tag)
+        sys.exit(0)
+sys.exit(1)
+' 2>/dev/null && return 0
+    fi
+
+    printf "%s\n" "$RAW_RELEASES_JSON" \
+        | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\(v[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)".*/\1/p' \
+        | head -n 1
+}
+
+default_image_tag() {
+    DEFAULT_IMAGE_TAG="$(fetch_latest_semver_release_tag || true)"
+    if [ -n "$DEFAULT_IMAGE_TAG" ]; then
+        printf "%s\n" "$DEFAULT_IMAGE_TAG"
+    else
+        printf "latest\n"
+    fi
+}
+
 select_image_tag() {
-    SELECTED_TAG="latest"
+    SELECTED_TAG="$(default_image_tag)"
     ALL_TAGS="$(fetch_available_tags || true)"
 
     if [ -z "$ALL_TAGS" ]; then
         echo "Select version:"
-        print_warn "No additional tags found. Using latest."
+        print_warn "No additional tags found. Using $SELECTED_TAG."
         print_info "Selected version: $SELECTED_TAG"
         echo ""
         return 0
@@ -1196,10 +1235,15 @@ select_image_tag() {
 
     if [ -z "$MENU_TAGS" ]; then
         echo "Select version:"
-        print_warn "No tags found. Using latest."
+        print_warn "No tags found. Using $SELECTED_TAG."
         print_info "Selected version: $SELECTED_TAG"
         echo ""
         return 0
+    fi
+
+    if [ -n "$SELECTED_TAG" ] && ! printf "%s\n" "$MENU_TAGS" | awk -v tag="$SELECTED_TAG" '$0 == tag {found=1; exit} END {exit found ? 0 : 1}'; then
+        MENU_TAGS="${SELECTED_TAG}
+${MENU_TAGS}"
     fi
 
     # Build menu from the tag list
@@ -1242,6 +1286,7 @@ create_instance() {
     # Compute defaults once up front
     DEFAULT_PORT="$(find_free_port 5080)"
     DEFAULT_NAME="$(suggest_next_instance_name "agent-zero")"
+    DEFAULT_TAG="$(default_image_tag)"
     QUICK_START=0
     WIZARD_STEP=0
     while [ "$WIZARD_STEP" -ge 0 ] && [ "$WIZARD_STEP" -le 6 ]; do
@@ -1259,7 +1304,7 @@ create_instance() {
                 if [ "$SELECTED_INDEX" = "0" ]; then
                     # Quick Start: use all defaults, skip to auth
                     QUICK_START=1
-                    SELECTED_TAG="latest"
+                    SELECTED_TAG="$DEFAULT_TAG"
                     CONTAINER_NAME="$DEFAULT_NAME"
                     INSTANCE_DIR="$INSTALL_ROOT/$CONTAINER_NAME"
                     DATA_DIR="$INSTANCE_DIR/usr"
@@ -1338,7 +1383,7 @@ create_instance() {
                 echo ""
                 if [ "$QUICK_START" = "1" ]; then
                     print_info "Quick Start selected. Using defaults:"
-                    print_ok "Version:   latest"
+                    print_ok "Version:   $SELECTED_TAG"
                     print_ok "Instance:  $CONTAINER_NAME"
                     print_ok "Port:      $PORT"
                     print_ok "Data dir:  $DATA_DIR"

@@ -69,7 +69,7 @@ Both `install.sh` and `install.ps1` implement the same flow:
 
 When you create a new instance, the installer will prompt you for:
 
-- **Version tag** (from Docker Hub tags, defaults to `latest`)
+- **Version tag** (`install.sh` Quick Start prefers the newest full semver GitHub Release tag; manual mode also shows Docker Hub tags)
 - **Instance/container name** (default: `agent-zero`, or `agent-zero-2`, ...)
 - **Data directory** (default: `~/agent-zero/<instance>/usr`)
 - **Web UI port** (default: first free port starting at `5080`)
