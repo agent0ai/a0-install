@@ -8,6 +8,7 @@ $script:HomeDir = [Environment]::GetFolderPath('UserProfile')
 $script:SelectedTag = 'latest'
 $script:DockerMode = 'windows'
 $script:WslDockerDistro = ''
+$script:WslKeepAliveNoticeShown = $false
 
 function Show-Banner {
     Write-Host @"
@@ -118,6 +119,141 @@ function Get-CleanCommandText {
     param([object]$Value)
 
     return (($Value | Out-String) -replace "`0", '').Trim()
+}
+
+function Get-WslKeepAlivePidFile {
+    $localAppData = [Environment]::GetFolderPath('LocalApplicationData')
+    if ([string]::IsNullOrWhiteSpace($localAppData)) {
+        $localAppData = $script:HomeDir
+    }
+    $stateDir = Join-Path $localAppData 'AgentZero'
+    New-Item -ItemType Directory -Force -Path $stateDir *> $null
+
+    $distroKey = if ([string]::IsNullOrWhiteSpace($script:WslDockerDistro)) {
+        'default'
+    }
+    else {
+        ($script:WslDockerDistro -replace '[^A-Za-z0-9_.-]', '_')
+    }
+    return (Join-Path $stateDir "wsl-docker-keepalive-$distroKey.pid")
+}
+
+function Test-ProcessIdRunning {
+    param([int]$ProcessId)
+
+    if ($ProcessId -le 0) {
+        return $false
+    }
+
+    try {
+        $null = Get-Process -Id $ProcessId -ErrorAction Stop
+        return $true
+    }
+    catch {
+        return $false
+    }
+}
+
+function Test-WslDockerKeepAliveRunning {
+    if ($script:DockerMode -ne 'wsl') {
+        return $false
+    }
+
+    $pidFile = Get-WslKeepAlivePidFile
+    if (-not (Test-Path -LiteralPath $pidFile)) {
+        return $false
+    }
+
+    $pidText = (Get-Content -LiteralPath $pidFile -ErrorAction SilentlyContinue | Select-Object -First 1)
+    $processId = 0
+    if (-not [int]::TryParse("$pidText", [ref]$processId)) {
+        Remove-Item -LiteralPath $pidFile -Force -ErrorAction SilentlyContinue
+        return $false
+    }
+
+    if (Test-ProcessIdRunning -ProcessId $processId) {
+        return $true
+    }
+
+    Remove-Item -LiteralPath $pidFile -Force -ErrorAction SilentlyContinue
+    return $false
+}
+
+function Start-WslDockerKeepAlive {
+    if ($script:DockerMode -ne 'wsl') {
+        return
+    }
+
+    if (Test-WslDockerKeepAliveRunning) {
+        return
+    }
+
+    $wsl = Get-Command wsl.exe -ErrorAction SilentlyContinue
+    if (-not $wsl) {
+        return
+    }
+
+    $keepAliveScript = "trap 'exit 0' TERM INT; while :; do sleep 2147483647 & wait `$!; done"
+    $distroLiteral = "$script:WslDockerDistro" -replace "'", "''"
+    $keepAliveLiteral = $keepAliveScript -replace "'", "''"
+    $childScript = @"
+`$ErrorActionPreference = 'SilentlyContinue'
+`$wslArgs = @()
+`$distro = '$distroLiteral'
+if (-not [string]::IsNullOrWhiteSpace(`$distro)) {
+    `$wslArgs += @('-d', `$distro)
+}
+`$wslArgs += @('-u', 'root', '--exec', 'sh', '-lc', '$keepAliveLiteral')
+& wsl.exe @wslArgs
+"@
+    $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($childScript))
+
+    try {
+        $process = Start-Process -FilePath 'powershell.exe' -ArgumentList @(
+            '-NoLogo',
+            '-NoProfile',
+            '-ExecutionPolicy',
+            'Bypass',
+            '-EncodedCommand',
+            $encodedCommand
+        ) -WindowStyle Hidden -PassThru
+        Set-Content -LiteralPath (Get-WslKeepAlivePidFile) -Value "$($process.Id)"
+        if (-not $script:WslKeepAliveNoticeShown) {
+            print_info "Keeping WSL distro '$script:WslDockerDistro' active while Agent Zero runs."
+            $script:WslKeepAliveNoticeShown = $true
+        }
+    }
+    catch {
+        print_warn "Could not start the WSL keepalive process. If WSL idles, running Agent Zero containers may stop."
+    }
+}
+
+function Stop-WslDockerKeepAlive {
+    if ($script:DockerMode -ne 'wsl') {
+        return
+    }
+
+    $pidFile = Get-WslKeepAlivePidFile
+    if (-not (Test-Path -LiteralPath $pidFile)) {
+        return
+    }
+
+    $pidText = (Get-Content -LiteralPath $pidFile -ErrorAction SilentlyContinue | Select-Object -First 1)
+    $processId = 0
+    if ([int]::TryParse("$pidText", [ref]$processId) -and (Test-ProcessIdRunning -ProcessId $processId)) {
+        Stop-Process -Id $processId -Force -ErrorAction SilentlyContinue
+    }
+    Remove-Item -LiteralPath $pidFile -Force -ErrorAction SilentlyContinue
+
+    $killArgs = @()
+    if (-not [string]::IsNullOrWhiteSpace($script:WslDockerDistro)) {
+        $killArgs += @('-d', $script:WslDockerDistro)
+    }
+    $killArgs += @('-u', 'root', '--exec', 'sh', '-lc', "pkill -f 'sleep 2147483647' 2>/dev/null || true; pkill -f '2147483647' 2>/dev/null || true")
+    try {
+        & wsl.exe @killArgs *> $null
+    }
+    catch { }
 }
 
 function Get-WslDockerDistros {
@@ -1111,6 +1247,7 @@ function create_instance {
     if ($LASTEXITCODE -ne 0) {
         throw 'Failed to start Agent Zero.'
     }
+    Start-WslDockerKeepAlive
 
     # Wait for the service to become ready
     Wait-ForReady -Url "http://localhost:$port"
@@ -1123,6 +1260,28 @@ function create_instance {
 
 function Get-AgentZeroContainerRows {
     return @(List-AgentZeroContainers)
+}
+
+function Test-AnyRunningAgentZeroContainer {
+    foreach ($row in (Get-AgentZeroContainerRows)) {
+        $parts = @("$row".Split('|', 3))
+        if ($parts.Count -lt 3) {
+            continue
+        }
+        if ($parts[2] -like 'Up*') {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Stop-WslDockerKeepAliveIfNoRunningAgentZero {
+    if ($script:DockerMode -ne 'wsl') {
+        return
+    }
+    if (-not (Test-AnyRunningAgentZeroContainer)) {
+        Stop-WslDockerKeepAlive
+    }
 }
 
 function manage_instances {
@@ -1183,6 +1342,9 @@ function manage_single_instance {
         }
 
         $isRunning = $selectedStatus -like 'Up*'
+        if ($isRunning) {
+            Start-WslDockerKeepAlive
+        }
         $instanceHeader = "Selected: $ContainerName ($selectedImage, $selectedStatus)"
 
         if ($isRunning) {
@@ -1239,6 +1401,7 @@ function manage_single_instance {
                 $runCheck = Invoke-Docker -Arguments @('ps', '--filter', "name=^/$ContainerName$", '--filter', 'status=running', '--format', '{{.Names}}') 2>$null
                 if ((Get-NonEmptyLines $runCheck) -contains $ContainerName) {
                     print_ok "Started '$ContainerName'."
+                    Start-WslDockerKeepAlive
                 }
                 else {
                     print_error "Failed to start '$ContainerName'."
@@ -1253,6 +1416,7 @@ function manage_single_instance {
                 Invoke-Docker -Arguments @('stop', $ContainerName) *> $null
                 if ($LASTEXITCODE -eq 0) {
                     print_ok "Stopped '$ContainerName'."
+                    Stop-WslDockerKeepAliveIfNoRunningAgentZero
                 }
                 else {
                     print_error "Failed to stop '$ContainerName'."
@@ -1266,6 +1430,7 @@ function manage_single_instance {
                 $runCheck = Invoke-Docker -Arguments @('ps', '--filter', "name=^/$ContainerName$", '--filter', 'status=running', '--format', '{{.Names}}') 2>$null
                 if ((Get-NonEmptyLines $runCheck) -contains $ContainerName) {
                     print_ok "Restarted '$ContainerName'."
+                    Start-WslDockerKeepAlive
                 }
                 else {
                     print_error "Failed to restart '$ContainerName'."
@@ -1285,6 +1450,7 @@ function manage_single_instance {
                     Invoke-Docker -Arguments @('rm', $ContainerName) *> $null
                     if ($LASTEXITCODE -eq 0) {
                         print_ok "Deleted '$ContainerName'."
+                        Stop-WslDockerKeepAliveIfNoRunningAgentZero
                     }
                     else {
                         print_error "Failed to delete '$ContainerName'."
@@ -1352,6 +1518,9 @@ function main {
     $existingCount = count_existing_agent_zero_containers
     if ($existingCount -lt 0) {
         $existingCount = 0
+    }
+    if ($script:DockerMode -eq 'wsl' -and (Test-AnyRunningAgentZeroContainer)) {
+        Start-WslDockerKeepAlive
     }
 
     if ($existingCount -gt 0) {

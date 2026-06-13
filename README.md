@@ -45,14 +45,14 @@ pwsh -File .\install.ps1
 
 ## Prerequisites
 
-- **Docker Engine / Docker Desktop** with a running daemon, or the macOS/Linux tools needed for the installer to set one up.
+- **Docker Engine / Docker Desktop** with a running daemon, or the platform tools needed for the installer to set one up or reuse an existing local runtime.
 
 Notes:
 
 - On **macOS**, the script can open Docker Desktop when it is installed. If Docker is missing, it can set up a Colima runtime with a dedicated `a0` profile and installer-owned Colima, Lima, and Docker CLI binaries. Homebrew is not required.
 - On **Linux**, `install.sh` can install Docker Engine through the detected package manager. Debian/Ubuntu use `apt-get install docker.io`.
 - On Linux families where the script detects `yast`, raw `rpm`, or no supported package manager, it will not guess a Docker installation path. Install Docker packages manually, then rerun the installer.
-- On **Windows**, `install.ps1` will not install Docker automatically. On client Windows, it directs you to Docker Desktop. On Windows Server, where Docker Desktop is not supported, it reports the need for an existing Docker endpoint or a WSL2-backed Linux Docker Engine with nested virtualization.
+- On **Windows**, `install.ps1` can reuse Docker Desktop when its Docker daemon is reachable, or reuse Docker Engine installed inside a WSL2 distro. When it uses WSL Docker Engine, it starts a lightweight WSL keepalive so Windows does not idle-stop the distro while Agent Zero containers are running. On Windows Server, where Docker Desktop is not supported, it reports the need for an existing Docker endpoint or a WSL2-backed Linux Docker Engine with nested virtualization.
 
 ## What the installer does
 
