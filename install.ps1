@@ -1,3 +1,7 @@
+param(
+    [switch]$A0ResumeRuntimeSetup
+)
+
 $ErrorActionPreference = 'Stop'
 
 # Agent Zero Install Script v1 (PowerShell)
@@ -10,6 +14,8 @@ $script:DockerMode = 'windows'
 $script:WslDockerDistro = ''
 $script:WslKeepAliveNoticeShown = $false
 $script:DefaultWslDistro = 'Ubuntu'
+$script:ResumeRuntimeSetup = [bool]$A0ResumeRuntimeSetup
+$script:RuntimeSetupRunOnceValue = 'AgentZeroInstallResumeRuntimeSetup'
 
 function Show-Banner {
     Write-Host @"
@@ -120,6 +126,106 @@ function Get-CleanCommandText {
     param([object]$Value)
 
     return (($Value | Out-String) -replace "`0", '').Trim()
+}
+
+function Get-AgentZeroStateDir {
+    $localAppData = [Environment]::GetFolderPath('LocalApplicationData')
+    if ([string]::IsNullOrWhiteSpace($localAppData)) {
+        $localAppData = $script:HomeDir
+    }
+    $stateDir = Join-Path $localAppData 'AgentZero'
+    New-Item -ItemType Directory -Force -Path $stateDir *> $null
+    return $stateDir
+}
+
+function Get-InstallerResumeScriptPath {
+    return (Join-Path (Get-AgentZeroStateDir) 'install-resume.ps1')
+}
+
+function Get-CurrentInstallerScriptPath {
+    if (-not [string]::IsNullOrWhiteSpace($PSCommandPath) -and (Test-Path -LiteralPath $PSCommandPath)) {
+        return $PSCommandPath
+    }
+    if ($MyInvocation.MyCommand -and -not [string]::IsNullOrWhiteSpace($MyInvocation.MyCommand.Path) -and (Test-Path -LiteralPath $MyInvocation.MyCommand.Path)) {
+        return $MyInvocation.MyCommand.Path
+    }
+    return ''
+}
+
+function Save-InstallerResumeScript {
+    $resumePath = Get-InstallerResumeScriptPath
+    $currentPath = Get-CurrentInstallerScriptPath
+
+    try {
+        if (-not [string]::IsNullOrWhiteSpace($currentPath)) {
+            Copy-Item -LiteralPath $currentPath -Destination $resumePath -Force
+            return $resumePath
+        }
+
+        Invoke-WebRequest -Uri 'https://ps.agent-zero.ai' -UseBasicParsing -OutFile $resumePath
+        return $resumePath
+    }
+    catch {
+        print_warn "Could not prepare automatic post-restart resume: $(Get-CleanCommandText $_)"
+        return ''
+    }
+}
+
+function Convert-ToWindowsCommandArg {
+    param([string]$Value)
+
+    return '"' + (($Value -replace '\\(?=")', '$0') -replace '"', '\"') + '"'
+}
+
+function Get-InstallerResumeLaunchCommand {
+    $resumePath = Save-InstallerResumeScript
+    if ([string]::IsNullOrWhiteSpace($resumePath)) {
+        return ''
+    }
+
+    $powershell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    if (-not (Test-Path -LiteralPath $powershell)) {
+        $powershell = 'powershell.exe'
+    }
+
+    return @(
+        (Convert-ToWindowsCommandArg $powershell),
+        '-NoLogo',
+        '-NoProfile',
+        '-ExecutionPolicy',
+        'Bypass',
+        '-File',
+        (Convert-ToWindowsCommandArg $resumePath),
+        '-A0ResumeRuntimeSetup'
+    ) -join ' '
+}
+
+function Register-InstallerRuntimeSetupResume {
+    $command = Get-InstallerResumeLaunchCommand
+    if ([string]::IsNullOrWhiteSpace($command)) {
+        return
+    }
+
+    try {
+        & reg.exe add 'HKCU\Software\Microsoft\Windows\CurrentVersion\RunOnce' `
+            /v $script:RuntimeSetupRunOnceValue `
+            /t REG_SZ `
+            /d $command `
+            /f *> $null
+        print_info 'Agent Zero installer will resume once after your next Windows sign-in.'
+    }
+    catch {
+        print_warn "Could not register automatic post-restart resume: $(Get-CleanCommandText $_)"
+    }
+}
+
+function Clear-InstallerRuntimeSetupResume {
+    try {
+        & reg.exe delete 'HKCU\Software\Microsoft\Windows\CurrentVersion\RunOnce' `
+            /v $script:RuntimeSetupRunOnceValue `
+            /f *> $null
+    }
+    catch { }
 }
 
 function Get-WslListText {
@@ -279,6 +385,7 @@ function Invoke-ElevatedPowerShellScript {
 function Install-WslFeatures {
     print_info 'Agent Zero will set up the local Windows runtime.'
     print_info 'Windows may ask for approval. A restart may be required before setup can continue.'
+    Register-InstallerRuntimeSetupResume
 
     $featureScript = @'
 $ErrorActionPreference = "Stop"
@@ -294,11 +401,12 @@ exit $LASTEXITCODE
 '@
 
     if (-not (Invoke-ElevatedPowerShellScript -Script $featureScript)) {
+        Clear-InstallerRuntimeSetupResume
         return 'failed'
     }
 
     print_warn 'Windows runtime setup was started.'
-    print_warn 'Restart Windows if prompted, then rerun this installer to continue Agent Zero setup.'
+    print_warn 'Restart Windows if prompted. The installer will resume once after your next sign-in.'
     return 'followup'
 }
 
@@ -412,12 +520,7 @@ docker info >/dev/null 2>&1
 }
 
 function Get-WslKeepAlivePidFile {
-    $localAppData = [Environment]::GetFolderPath('LocalApplicationData')
-    if ([string]::IsNullOrWhiteSpace($localAppData)) {
-        $localAppData = $script:HomeDir
-    }
-    $stateDir = Join-Path $localAppData 'AgentZero'
-    New-Item -ItemType Directory -Force -Path $stateDir *> $null
+    $stateDir = Get-AgentZeroStateDir
 
     $distroKey = if ([string]::IsNullOrWhiteSpace($script:WslDockerDistro)) {
         'default'
@@ -1959,6 +2062,7 @@ function main_menu_for_existing {
 
 function main {
     check_docker
+    Clear-InstallerRuntimeSetupResume
     Write-Host ''
 
     $existingCount = count_existing_agent_zero_containers
