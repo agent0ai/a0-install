@@ -6,6 +6,8 @@ $ErrorActionPreference = 'Stop'
 
 $script:HomeDir = [Environment]::GetFolderPath('UserProfile')
 $script:SelectedTag = 'latest'
+$script:DockerMode = 'windows'
+$script:WslDockerDistro = ''
 
 function Show-Banner {
     Write-Host @"
@@ -112,6 +114,114 @@ function Show-WindowsClientDockerGuidance {
     print_info 'For a WSL Docker Engine endpoint, expose Docker on loopback only, for example tcp://127.0.0.1:23750.'
 }
 
+function Get-CleanCommandText {
+    param([object]$Value)
+
+    return (($Value | Out-String) -replace "`0", '').Trim()
+}
+
+function Get-WslDockerDistros {
+    $wsl = Get-Command wsl.exe -ErrorAction SilentlyContinue
+    if (-not $wsl) {
+        return @()
+    }
+
+    try {
+        $raw = & wsl.exe -l -v 2>$null
+    }
+    catch {
+        return @()
+    }
+
+    $distros = New-Object System.Collections.Generic.List[object]
+    foreach ($lineRaw in ((Get-CleanCommandText $raw) -split "`r?`n")) {
+        $line = $lineRaw.Trim()
+        if ([string]::IsNullOrWhiteSpace($line) -or $line -match '^NAME\s+STATE\s+VERSION$') {
+            continue
+        }
+
+        $isDefault = $line.StartsWith('*')
+        $clean = $line -replace '^\*\s*', ''
+        $parts = @($clean -split '\s+' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        if ($parts.Count -lt 3) {
+            continue
+        }
+
+        $versionText = $parts[$parts.Count - 1]
+        $state = $parts[$parts.Count - 2]
+        $name = ($parts[0..($parts.Count - 3)] -join ' ')
+        $version = 0
+        if (-not [int]::TryParse($versionText, [ref]$version)) {
+            continue
+        }
+
+        $distros.Add([pscustomobject]@{
+            Name = $name
+            State = $state
+            Version = $version
+            IsDefault = $isDefault
+        })
+    }
+
+    return $distros.ToArray()
+}
+
+function Select-WslDockerDistro {
+    $distros = @(Get-WslDockerDistros | Where-Object { $_.Version -eq 2 })
+    if ($distros.Count -eq 0) {
+        return ''
+    }
+
+    $selected = $distros | Where-Object { $_.IsDefault } | Select-Object -First 1
+    if (-not $selected) {
+        $selected = $distros | Where-Object { $_.Name -eq 'Ubuntu' } | Select-Object -First 1
+    }
+    if (-not $selected) {
+        $selected = $distros | Where-Object { $_.Name -like 'Ubuntu*' } | Select-Object -First 1
+    }
+    if (-not $selected) {
+        $selected = $distros | Select-Object -First 1
+    }
+
+    return "$($selected.Name)"
+}
+
+function Test-WslDockerAvailable {
+    $distro = Select-WslDockerDistro
+    if ([string]::IsNullOrWhiteSpace($distro)) {
+        return $false
+    }
+
+    try {
+        & wsl.exe -d $distro --exec sh -lc 'docker info >/dev/null 2>&1'
+        if ($LASTEXITCODE -eq 0) {
+            $script:DockerMode = 'wsl'
+            $script:WslDockerDistro = $distro
+            return $true
+        }
+    }
+    catch { }
+
+    return $false
+}
+
+function Invoke-Docker {
+    param([string[]]$Arguments)
+
+    if ($script:DockerMode -eq 'wsl') {
+        $wslArgs = @()
+        if (-not [string]::IsNullOrWhiteSpace($script:WslDockerDistro)) {
+            $wslArgs += @('-d', $script:WslDockerDistro)
+        }
+        $wslArgs += @('--exec', 'docker')
+        $wslArgs += $Arguments
+        & wsl.exe @wslArgs
+        return
+    }
+
+    & docker @Arguments
+}
+
 # Check whether a TCP port is in use on localhost.
 # Checks Docker container port mappings and system listeners.
 # Returns $true if in use, $false if free.
@@ -120,7 +230,7 @@ function Is-PortInUse {
 
     # Check Docker-published ports
     try {
-        $dockerPorts = & docker ps -a --format '{{.Ports}}' 2>$null
+        $dockerPorts = Invoke-Docker -Arguments @('ps', '-a', '--format', '{{.Ports}}') 2>$null
         if ($LASTEXITCODE -eq 0 -and $dockerPorts) {
             $portsText = ($dockerPorts | Out-String)
             if ($portsText -match ":${Port}->") {
@@ -310,7 +420,7 @@ function select_from_menu {
 
 function check_docker_daemon_running {
     try {
-        & docker info *> $null 2>&1
+        Invoke-Docker -Arguments @('info') *> $null 2>&1
         return ($LASTEXITCODE -eq 0)
     }
     catch {
@@ -372,6 +482,10 @@ function wait_for_docker_daemon {
 
 function check_docker {
     if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
+        if (Test-WslDockerAvailable) {
+            print_ok "Using Docker Engine inside WSL distro '$script:WslDockerDistro'"
+            return
+        }
         if (Test-WindowsServer) {
             Show-WindowsServerDockerGuidance
             exit 1
@@ -406,6 +520,10 @@ function check_docker {
                 print_ok 'Docker found'
                 break
             }
+            if (Test-WslDockerAvailable) {
+                print_ok "Using Docker Engine inside WSL distro '$script:WslDockerDistro'"
+                return
+            }
         }
     }
     else {
@@ -413,6 +531,10 @@ function check_docker {
     }
 
     if (-not (check_docker_daemon_running)) {
+        if (Test-WslDockerAvailable) {
+            print_ok "Using Docker Engine inside WSL distro '$script:WslDockerDistro'"
+            return
+        }
         print_warn "Docker daemon is not running"
         if (Test-WindowsServer) {
             print_error 'Docker is installed, but its daemon is not reachable.'
@@ -502,24 +624,24 @@ function List-AgentZeroContainers {
 
     try {
         # --- Pass 1: labeled containers (fast, single docker command) ---
-        $labeled = & docker ps -a --filter 'label=ai.agent0.managed=true' --format '{{.Names}}' 2>$null
+        $labeled = Invoke-Docker -Arguments @('ps', '-a', '--filter', 'label=ai.agent0.managed=true', '--format', '{{.Names}}') 2>$null
         if ($LASTEXITCODE -eq 0 -and $labeled) {
             foreach ($name in (Get-NonEmptyLines $labeled)) {
-                $cfgImage = (& docker inspect --format '{{.Config.Image}}' $name 2>$null) | Select-Object -First 1
-                $status = (& docker ps -a --filter "name=^/$name$" --format '{{.Status}}' 2>$null) | Select-Object -First 1
+                $cfgImage = (Invoke-Docker -Arguments @('inspect', '--format', '{{.Config.Image}}', $name) 2>$null) | Select-Object -First 1
+                $status = (Invoke-Docker -Arguments @('ps', '-a', '--filter', "name=^/$name$", '--format', '{{.Status}}') 2>$null) | Select-Object -First 1
                 $result.Add("$name|$cfgImage|$status")
                 $seen[$name] = $true
             }
         }
 
         # --- Pass 2: unlabeled containers whose Config.Image matches (legacy) ---
-        $allNames = & docker ps -a --format '{{.Names}}' 2>$null
+        $allNames = Invoke-Docker -Arguments @('ps', '-a', '--format', '{{.Names}}') 2>$null
         if ($LASTEXITCODE -eq 0 -and $allNames) {
             foreach ($name in (Get-NonEmptyLines $allNames)) {
                 if ($seen.ContainsKey($name)) { continue }
-                $cfgImage = (& docker inspect --format '{{.Config.Image}}' $name 2>$null) | Select-Object -First 1
+                $cfgImage = (Invoke-Docker -Arguments @('inspect', '--format', '{{.Config.Image}}', $name) 2>$null) | Select-Object -First 1
                 if (-not ($cfgImage -match '^agent0ai/agent-zero(:|$)')) { continue }
-                $status = (& docker ps -a --filter "name=^/$name$" --format '{{.Status}}' 2>$null) | Select-Object -First 1
+                $status = (Invoke-Docker -Arguments @('ps', '-a', '--filter', "name=^/$name$", '--format', '{{.Status}}') 2>$null) | Select-Object -First 1
                 $result.Add("$name|$cfgImage|$status")
             }
         }
@@ -536,7 +658,7 @@ function count_existing_agent_zero_containers {
 function instance_name_taken {
     param([string]$NameToCheck)
 
-    $names = & docker ps -a --format '{{.Names}}' 2>$null
+    $names = Invoke-Docker -Arguments @('ps', '-a', '--format', '{{.Names}}') 2>$null
     if ($LASTEXITCODE -ne 0) {
         return $false
     }
@@ -768,6 +890,16 @@ function Expand-UserPath {
 function Convert-ToDockerPath {
     param([string]$PathValue)
 
+    if ($script:DockerMode -eq 'wsl') {
+        try {
+            $converted = & wsl.exe -d $script:WslDockerDistro --exec wslpath -a $PathValue 2>$null
+            if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace("$converted")) {
+                return (Get-CleanCommandText $converted)
+            }
+        }
+        catch { }
+    }
+
     return $PathValue -replace '\\', '/'
 }
 
@@ -955,7 +1087,7 @@ function create_instance {
     $image = "agent0ai/agent-zero:$($script:SelectedTag)"
 
     print_info 'Pulling Agent Zero image (this may take a moment)...'
-    & docker pull --quiet $image
+    Invoke-Docker -Arguments @('pull', '--quiet', $image)
     if ($LASTEXITCODE -ne 0) {
         throw 'Failed to pull Docker image.'
     }
@@ -975,7 +1107,7 @@ function create_instance {
         $runArgs += @('-e', "AUTH_LOGIN=$authLogin", '-e', "AUTH_PASSWORD=$authPassword")
     }
     $runArgs += $image
-    & docker @runArgs
+    Invoke-Docker -Arguments $runArgs
     if ($LASTEXITCODE -ne 0) {
         throw 'Failed to start Agent Zero.'
     }
@@ -1039,10 +1171,10 @@ function manage_single_instance {
     param([string]$ContainerName)
 
     # Look up the image for display (Config.Image preserves the original tag even when the image is untagged)
-    $selectedImage = ((Get-NonEmptyLines (& docker inspect --format '{{.Config.Image}}' $ContainerName 2>$null)) | Select-Object -First 1)
+    $selectedImage = ((Get-NonEmptyLines (Invoke-Docker -Arguments @('inspect', '--format', '{{.Config.Image}}', $ContainerName) 2>$null)) | Select-Object -First 1)
 
     while ($true) {
-        $statusOutput = & docker ps -a --filter "name=^/$ContainerName$" --format '{{.Status}}' 2>$null
+        $statusOutput = Invoke-Docker -Arguments @('ps', '-a', '--filter', "name=^/$ContainerName$", '--format', '{{.Status}}') 2>$null
         $selectedStatus = ((Get-NonEmptyLines $statusOutput) | Select-Object -First 1)
 
         # If container no longer exists (e.g. after delete), return
@@ -1080,7 +1212,7 @@ function manage_single_instance {
 
         switch ($actionKey) {
             'open' {
-                $portOutput = & docker port $ContainerName '80/tcp' 2>$null
+                $portOutput = Invoke-Docker -Arguments @('port', $ContainerName, '80/tcp') 2>$null
                 $hostPort = ''
 
                 foreach ($line in (Get-NonEmptyLines $portOutput)) {
@@ -1102,9 +1234,9 @@ function manage_single_instance {
             }
             'start' {
                 print_info "Starting '$ContainerName'..."
-                $startOutput = & docker start $ContainerName 2>&1
+                $startOutput = Invoke-Docker -Arguments @('start', $ContainerName) 2>&1
                 # Verify actual container state
-                $runCheck = & docker ps --filter "name=^/$ContainerName$" --filter 'status=running' --format '{{.Names}}' 2>$null
+                $runCheck = Invoke-Docker -Arguments @('ps', '--filter', "name=^/$ContainerName$", '--filter', 'status=running', '--format', '{{.Names}}') 2>$null
                 if ((Get-NonEmptyLines $runCheck) -contains $ContainerName) {
                     print_ok "Started '$ContainerName'."
                 }
@@ -1118,7 +1250,7 @@ function manage_single_instance {
             }
             'stop' {
                 print_info "Stopping '$ContainerName'..."
-                & docker stop $ContainerName *> $null
+                Invoke-Docker -Arguments @('stop', $ContainerName) *> $null
                 if ($LASTEXITCODE -eq 0) {
                     print_ok "Stopped '$ContainerName'."
                 }
@@ -1129,9 +1261,9 @@ function manage_single_instance {
             }
             'restart' {
                 print_info "Restarting '$ContainerName'..."
-                $restartOutput = & docker restart $ContainerName 2>&1
+                $restartOutput = Invoke-Docker -Arguments @('restart', $ContainerName) 2>&1
                 # Verify actual container state
-                $runCheck = & docker ps --filter "name=^/$ContainerName$" --filter 'status=running' --format '{{.Names}}' 2>$null
+                $runCheck = Invoke-Docker -Arguments @('ps', '--filter', "name=^/$ContainerName$", '--filter', 'status=running', '--format', '{{.Names}}') 2>$null
                 if ((Get-NonEmptyLines $runCheck) -contains $ContainerName) {
                     print_ok "Restarted '$ContainerName'."
                 }
@@ -1149,8 +1281,8 @@ function manage_single_instance {
                 Write-Host ''
                 if ($confirmKey.KeyChar -eq 'y' -or $confirmKey.KeyChar -eq 'Y') {
                     # Stop first if running
-                    & docker stop $ContainerName *> $null
-                    & docker rm $ContainerName *> $null
+                    Invoke-Docker -Arguments @('stop', $ContainerName) *> $null
+                    Invoke-Docker -Arguments @('rm', $ContainerName) *> $null
                     if ($LASTEXITCODE -eq 0) {
                         print_ok "Deleted '$ContainerName'."
                     }
