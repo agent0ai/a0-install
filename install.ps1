@@ -9,6 +9,7 @@ $script:SelectedTag = 'latest'
 $script:DockerMode = 'windows'
 $script:WslDockerDistro = ''
 $script:WslKeepAliveNoticeShown = $false
+$script:DefaultWslDistro = 'Ubuntu'
 
 function Show-Banner {
     Write-Host @"
@@ -105,20 +106,309 @@ function Show-WindowsClientDockerGuidance {
 
     if ($DaemonOnly) {
         print_error 'Docker CLI is installed, but the Docker daemon is not reachable.'
-        print_info 'Start Docker Desktop, or set DOCKER_HOST to a reachable Docker-compatible endpoint, then rerun this installer.'
+        print_info 'Start Docker Desktop, set DOCKER_HOST to a reachable Docker-compatible endpoint, or rerun this installer interactively to set up the Agent Zero local runtime.'
     }
     else {
         print_error 'Docker is not installed or is not on PATH.'
-        print_info 'Install Docker Desktop, or install Docker CLI and configure it for a Docker-compatible endpoint, then rerun this installer.'
+        print_info 'Rerun this installer interactively to set up the Agent Zero local runtime, or install Docker Desktop / Docker CLI manually and rerun.'
     }
 
-    print_info 'For a WSL Docker Engine endpoint, expose Docker on loopback only, for example tcp://127.0.0.1:23750.'
+    print_info 'For a manual WSL Docker Engine endpoint, expose Docker on loopback only, for example tcp://127.0.0.1:23750.'
 }
 
 function Get-CleanCommandText {
     param([object]$Value)
 
     return (($Value | Out-String) -replace "`0", '').Trim()
+}
+
+function Get-WslListText {
+    $wsl = Get-Command wsl.exe -ErrorAction SilentlyContinue
+    if (-not $wsl) {
+        return ''
+    }
+
+    try {
+        $raw = & wsl.exe -l -v 2>&1
+        return (Get-CleanCommandText $raw)
+    }
+    catch {
+        return (Get-CleanCommandText $_)
+    }
+}
+
+function Test-WslFeaturesUsable {
+    param([string]$ListText)
+
+    $value = "$ListText"
+    if ($value -match 'WSL_E_WSL_OPTIONAL_COMPONENT_REQUIRED') {
+        return $false
+    }
+    if ($value -match 'WSL_E_DEFAULT_DISTRO_NOT_FOUND') {
+        return $true
+    }
+    if ($value -match 'has no installed distributions|no installed distributions|non ha distribuzioni installate') {
+        return $true
+    }
+    if ($value -match '(?im)^\s*\*?\s*NAME\s+STATE\s+VERSION\b') {
+        return $true
+    }
+
+    return $false
+}
+
+function Test-WslCommandOk {
+    param(
+        [string]$Distro,
+        [string]$Script
+    )
+
+    try {
+        $wslArgs = @()
+        if (-not [string]::IsNullOrWhiteSpace($Distro)) {
+            $wslArgs += @('-d', $Distro)
+        }
+        $wslArgs += @('--exec', 'sh', '-lc', $Script)
+        & wsl.exe @wslArgs *> $null
+        return ($LASTEXITCODE -eq 0)
+    }
+    catch {
+        return $false
+    }
+}
+
+function Test-WslRootCommandOk {
+    param(
+        [string]$Distro,
+        [string]$Script
+    )
+
+    try {
+        $wslArgs = @()
+        if (-not [string]::IsNullOrWhiteSpace($Distro)) {
+            $wslArgs += @('-d', $Distro)
+        }
+        $wslArgs += @('-u', 'root', '--exec', 'sh', '-lc', $Script)
+        & wsl.exe @wslArgs *> $null
+        return ($LASTEXITCODE -eq 0)
+    }
+    catch {
+        return $false
+    }
+}
+
+function Invoke-WslRootShell {
+    param(
+        [string]$Distro,
+        [string]$Script
+    )
+
+    $wslArgs = @()
+    if (-not [string]::IsNullOrWhiteSpace($Distro)) {
+        $wslArgs += @('-d', $Distro)
+    }
+    $wslArgs += @('-u', 'root', '--exec', 'sh', '-lc', $Script)
+    & wsl.exe @wslArgs
+}
+
+function Get-UbuntuLauncherBinary {
+    foreach ($binary in @('ubuntu.exe', 'ubuntu2404.exe', 'ubuntu2204.exe', 'ubuntu2004.exe')) {
+        $cmd = Get-Command $binary -ErrorAction SilentlyContinue
+        if ($cmd) {
+            return $cmd.Source
+        }
+    }
+
+    return ''
+}
+
+function Register-UbuntuPackageAsRoot {
+    $launcher = Get-UbuntuLauncherBinary
+    if ([string]::IsNullOrWhiteSpace($launcher)) {
+        return $false
+    }
+
+    print_info "Preparing $script:DefaultWslDistro for Agent Zero..."
+    try {
+        & $launcher install --root *> $null
+        if ($LASTEXITCODE -eq 0) {
+            return $true
+        }
+    }
+    catch {
+        $message = Get-CleanCommandText $_
+        if ($message -match 'already installed|gi[aà]\s+installato') {
+            return $true
+        }
+    }
+
+    return $false
+}
+
+function Invoke-ElevatedPowerShellScript {
+    param([string]$Script)
+
+    try {
+        $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($Script))
+        $argsList = @(
+            '-NoLogo',
+            '-NoProfile',
+            '-ExecutionPolicy',
+            'Bypass',
+            '-EncodedCommand',
+            $encodedCommand
+        )
+        $process = Start-Process -FilePath 'powershell.exe' `
+            -ArgumentList $argsList `
+            -Verb RunAs `
+            -WindowStyle Hidden `
+            -Wait `
+            -PassThru
+        if ($null -ne $process.ExitCode -and $process.ExitCode -ne 0) {
+            print_error "Windows setup exited with code $($process.ExitCode)."
+            return $false
+        }
+        return $true
+    }
+    catch {
+        print_error "Windows setup was not completed: $(Get-CleanCommandText $_)"
+        return $false
+    }
+}
+
+function Install-WslFeatures {
+    print_info 'Agent Zero will set up the local Windows runtime.'
+    print_info 'Windows may ask for approval. A restart may be required before setup can continue.'
+
+    $featureScript = @'
+$ErrorActionPreference = "Stop"
+wsl.exe --install --no-distribution
+if ($LASTEXITCODE -ne 0) {
+    wsl.exe --install --no-distribution --web-download
+}
+if ($LASTEXITCODE -ne 0) {
+    exit $LASTEXITCODE
+}
+wsl.exe --set-default-version 2
+exit $LASTEXITCODE
+'@
+
+    if (-not (Invoke-ElevatedPowerShellScript -Script $featureScript)) {
+        return 'failed'
+    }
+
+    print_warn 'Windows runtime setup was started.'
+    print_warn 'Restart Windows if prompted, then rerun this installer to continue Agent Zero setup.'
+    return 'followup'
+}
+
+function Install-WslDistribution {
+    print_info "Installing $script:DefaultWslDistro for Agent Zero..."
+
+    $installed = $false
+    try {
+        & wsl.exe --install -d $script:DefaultWslDistro --no-launch
+        if ($LASTEXITCODE -eq 0) {
+            $installed = $true
+        }
+        else {
+            & wsl.exe --install -d $script:DefaultWslDistro --no-launch --web-download
+            $installed = ($LASTEXITCODE -eq 0)
+        }
+    }
+    catch {
+        $installed = $false
+    }
+
+    if (-not $installed) {
+        print_error "Could not install $script:DefaultWslDistro for WSL."
+        return 'failed'
+    }
+
+    if (Test-WslRootCommandOk -Distro $script:DefaultWslDistro -Script 'true') {
+        return 'ready'
+    }
+
+    if ((Register-UbuntuPackageAsRoot) -and (Test-WslRootCommandOk -Distro $script:DefaultWslDistro -Script 'true')) {
+        return 'ready'
+    }
+
+    print_warn 'Linux distribution setup was started.'
+    print_warn 'If Windows opens a first-run setup window or asks for a restart, complete that and rerun this installer.'
+    return 'followup'
+}
+
+function Install-DockerEngineInWsl {
+    param([string]$Distro)
+
+    if (-not (Test-WslRootCommandOk -Distro $Distro -Script '. /etc/os-release 2>/dev/null; [ "${ID:-}" = "ubuntu" ]')) {
+        print_error "Automatic WSL runtime setup currently expects an Ubuntu WSL2 distro."
+        print_info "Install $script:DefaultWslDistro with WSL or install Docker Engine manually inside '$Distro', then rerun this installer."
+        return $false
+    }
+
+    print_info "Installing Docker Engine inside WSL distro '$Distro'..."
+    $installScript = @'
+set -eu
+export DEBIAN_FRONTEND=noninteractive
+apt-get update
+apt-get install -y ca-certificates curl python3
+for pkg in docker.io docker-compose docker-compose-v2 docker-doc podman-docker containerd runc; do apt-get remove -y "$pkg" >/dev/null 2>&1 || true; done
+install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+chmod a+r /etc/apt/keyrings/docker.asc
+. /etc/os-release
+codename="${UBUNTU_CODENAME:-${VERSION_CODENAME:-}}"
+if [ -z "$codename" ]; then echo "Could not determine Ubuntu codename" >&2; exit 1; fi
+arch="$(dpkg --print-architecture)"
+cat > /etc/apt/sources.list.d/docker.sources <<EOF
+Types: deb
+URIs: https://download.docker.com/linux/ubuntu
+Suites: ${codename}
+Components: stable
+Architectures: ${arch}
+Signed-By: /etc/apt/keyrings/docker.asc
+EOF
+apt-get update
+apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+'@
+
+    try {
+        Invoke-WslRootShell -Distro $Distro -Script $installScript
+        if ($LASTEXITCODE -eq 0) {
+            return $true
+        }
+    }
+    catch { }
+
+    print_error "Could not install Docker Engine inside WSL distro '$Distro'."
+    return $false
+}
+
+function Start-WslDockerEngine {
+    param([string]$Distro)
+
+    $startScript = @'
+set -eu
+if docker info >/dev/null 2>&1; then exit 0; fi
+if command -v systemctl >/dev/null 2>&1 && [ "$(ps -p 1 -o comm= 2>/dev/null)" = "systemd" ]; then
+    systemctl reset-failed docker || true
+    systemctl start docker || systemctl restart docker
+elif command -v service >/dev/null 2>&1; then
+    service docker start || service docker restart
+else
+    dockerd >/tmp/a0-dockerd.log 2>&1 &
+fi
+docker info >/dev/null 2>&1
+'@
+
+    try {
+        Invoke-WslRootShell -Distro $Distro -Script $startScript *> $null
+        return ($LASTEXITCODE -eq 0)
+    }
+    catch {
+        return $false
+    }
 }
 
 function Get-WslKeepAlivePidFile {
@@ -262,12 +552,7 @@ function Get-WslDockerDistros {
         return @()
     }
 
-    try {
-        $raw = & wsl.exe -l -v 2>$null
-    }
-    catch {
-        return @()
-    }
+    $raw = Get-WslListText
 
     $distros = New-Object System.Collections.Generic.List[object]
     foreach ($lineRaw in ((Get-CleanCommandText $raw) -split "`r?`n")) {
@@ -302,41 +587,168 @@ function Get-WslDockerDistros {
     return $distros.ToArray()
 }
 
-function Select-WslDockerDistro {
+function Get-WslDistroCandidates {
+    param([switch]$PreferUbuntu)
+
     $distros = @(Get-WslDockerDistros | Where-Object { $_.Version -eq 2 })
+    $ordered = New-Object System.Collections.Generic.List[object]
+    $seen = @{}
+
+    function Add-Candidate {
+        param([object]$Distro)
+        if ($null -eq $Distro) {
+            return
+        }
+        $name = "$($Distro.Name)"
+        if ([string]::IsNullOrWhiteSpace($name) -or $seen.ContainsKey($name)) {
+            return
+        }
+        $seen[$name] = $true
+        $ordered.Add($Distro)
+    }
+
+    if ($PreferUbuntu) {
+        $distros | Where-Object { $_.Name -eq $script:DefaultWslDistro } | ForEach-Object { Add-Candidate $_ }
+        $distros | Where-Object { $_.Name -like "$script:DefaultWslDistro*" } | ForEach-Object { Add-Candidate $_ }
+        $distros | Where-Object { $_.IsDefault } | ForEach-Object { Add-Candidate $_ }
+    }
+    else {
+        $distros | Where-Object { $_.IsDefault } | ForEach-Object { Add-Candidate $_ }
+        $distros | Where-Object { $_.Name -eq $script:DefaultWslDistro } | ForEach-Object { Add-Candidate $_ }
+        $distros | Where-Object { $_.Name -like "$script:DefaultWslDistro*" } | ForEach-Object { Add-Candidate $_ }
+    }
+
+    $distros | ForEach-Object { Add-Candidate $_ }
+    return $ordered.ToArray()
+}
+
+function Select-WslDockerDistro {
+    $distros = @(Get-WslDistroCandidates)
     if ($distros.Count -eq 0) {
         return ''
     }
 
-    $selected = $distros | Where-Object { $_.IsDefault } | Select-Object -First 1
-    if (-not $selected) {
-        $selected = $distros | Where-Object { $_.Name -eq 'Ubuntu' } | Select-Object -First 1
+    $selected = $distros | Select-Object -First 1
+    return "$($selected.Name)"
+}
+
+function Select-WslSetupDistro {
+    $distros = @(Get-WslDistroCandidates -PreferUbuntu)
+    if ($distros.Count -eq 0) {
+        return ''
     }
+
+    $selected = $distros | Where-Object { $_.Name -eq $script:DefaultWslDistro } | Select-Object -First 1
     if (-not $selected) {
-        $selected = $distros | Where-Object { $_.Name -like 'Ubuntu*' } | Select-Object -First 1
+        $selected = $distros | Where-Object { $_.Name -like "$script:DefaultWslDistro*" } | Select-Object -First 1
     }
+
     if (-not $selected) {
-        $selected = $distros | Select-Object -First 1
+        return ''
     }
 
     return "$($selected.Name)"
 }
 
 function Test-WslDockerAvailable {
-    $distro = Select-WslDockerDistro
-    if ([string]::IsNullOrWhiteSpace($distro)) {
-        return $false
+    foreach ($candidate in (Get-WslDistroCandidates)) {
+        $distro = "$($candidate.Name)"
+        try {
+            & wsl.exe -d $distro --exec sh -lc 'docker info >/dev/null 2>&1'
+            if ($LASTEXITCODE -eq 0) {
+                $script:DockerMode = 'wsl'
+                $script:WslDockerDistro = $distro
+                return $true
+            }
+        }
+        catch { }
     }
 
-    try {
-        & wsl.exe -d $distro --exec sh -lc 'docker info >/dev/null 2>&1'
-        if ($LASTEXITCODE -eq 0) {
+    return $false
+}
+
+function Use-WslDockerRuntimeIfInstalled {
+    foreach ($candidate in (Get-WslDistroCandidates)) {
+        $distro = "$($candidate.Name)"
+        $hasDocker = Test-WslCommandOk -Distro $distro -Script 'command -v docker >/dev/null 2>&1'
+        $hasDockerd = Test-WslCommandOk -Distro $distro -Script 'command -v dockerd >/dev/null 2>&1'
+        if (-not ($hasDocker -and $hasDockerd)) {
+            continue
+        }
+
+        if (Start-WslDockerEngine -Distro $distro) {
             $script:DockerMode = 'wsl'
             $script:WslDockerDistro = $distro
+            print_ok "Using Docker Engine inside WSL distro '$script:WslDockerDistro'"
             return $true
         }
     }
-    catch { }
+
+    return $false
+}
+
+function Ensure-WindowsClientWslRuntime {
+    if (Test-WindowsServer) {
+        Show-WindowsServerDockerGuidance
+        return 'failed'
+    }
+
+    $wsl = Get-Command wsl.exe -ErrorAction SilentlyContinue
+    if (-not $wsl) {
+        return (Install-WslFeatures)
+    }
+
+    $wslList = Get-WslListText
+    if (-not (Test-WslFeaturesUsable -ListText $wslList)) {
+        return (Install-WslFeatures)
+    }
+
+    if (Use-WslDockerRuntimeIfInstalled) {
+        return 'ready'
+    }
+
+    $distro = Select-WslSetupDistro
+    if ([string]::IsNullOrWhiteSpace($distro)) {
+        $distroStatus = Install-WslDistribution
+        if ($distroStatus -ne 'ready') {
+            return $distroStatus
+        }
+        $distro = $script:DefaultWslDistro
+    }
+
+    if (-not (Test-WslRootCommandOk -Distro $distro -Script 'true')) {
+        print_warn "WSL distro '$distro' is not ready for command-line setup yet."
+        print_warn 'If Windows opened a first-run setup window or asks for a restart, complete that and rerun this installer.'
+        return 'followup'
+    }
+
+    $hasDocker = Test-WslCommandOk -Distro $distro -Script 'command -v docker >/dev/null 2>&1'
+    $hasDockerd = Test-WslCommandOk -Distro $distro -Script 'command -v dockerd >/dev/null 2>&1'
+    if (-not ($hasDocker -and $hasDockerd)) {
+        if (-not (Install-DockerEngineInWsl -Distro $distro)) {
+            return 'failed'
+        }
+    }
+
+    if (-not (Start-WslDockerEngine -Distro $distro)) {
+        print_error "Could not start Docker Engine inside WSL distro '$distro'."
+        return 'failed'
+    }
+
+    $script:DockerMode = 'wsl'
+    $script:WslDockerDistro = $distro
+    print_ok "Using Docker Engine inside WSL distro '$script:WslDockerDistro'"
+    return 'ready'
+}
+
+function Complete-WindowsClientRuntimeSetup {
+    $status = Ensure-WindowsClientWslRuntime
+    if ($status -eq 'ready') {
+        return $true
+    }
+    if ($status -eq 'followup') {
+        exit 0
+    }
 
     return $false
 }
@@ -569,6 +981,17 @@ function check_docker_daemon_running {
 function start_docker_daemon {
     print_info "Starting Docker Desktop..."
 
+    $desktopPath = Get-DockerDesktopPath
+    if (-not [string]::IsNullOrWhiteSpace($desktopPath)) {
+        Start-Process -FilePath $desktopPath
+        return $true
+    }
+
+    print_info "Docker Desktop was not found."
+    return $false
+}
+
+function Get-DockerDesktopPath {
     $candidatePaths = @(
         (Join-Path $env:ProgramFiles 'Docker\Docker\Docker Desktop.exe')
     )
@@ -579,18 +1002,20 @@ function start_docker_daemon {
 
     foreach ($path in $candidatePaths) {
         if (Test-Path -LiteralPath $path) {
-            Start-Process -FilePath $path
-            return $true
+            return $path
         }
     }
 
+    return ''
+}
+
+function Open-DockerDesktopDownload {
     try {
-        Start-Process 'docker-desktop:'
-        return $true
+        Start-Process 'https://www.docker.com/products/docker-desktop/'
+        print_ok 'Opened Docker Desktop download page in browser.'
     }
     catch {
-        print_error "Cannot start Docker Desktop automatically."
-        return $false
+        print_warn 'Could not open browser. Please visit https://www.docker.com/products/docker-desktop/ manually.'
     }
 }
 
@@ -622,6 +1047,9 @@ function check_docker {
             print_ok "Using Docker Engine inside WSL distro '$script:WslDockerDistro'"
             return
         }
+        if (Use-WslDockerRuntimeIfInstalled) {
+            return
+        }
         if (Test-WindowsServer) {
             Show-WindowsServerDockerGuidance
             exit 1
@@ -631,10 +1059,10 @@ function check_docker {
             exit 1
         }
 
-        # Docker not found — show interactive menu instead of auto-opening browser
+        # Docker not found - offer the Agent Zero local runtime before manual Docker paths.
         while ($true) {
-            $idx = select_from_menu -Header 'Docker is not installed. Please install Docker Desktop to continue.' `
-                -Options @('Open Docker Desktop download page', 'Check again')
+            $idx = select_from_menu -Header 'Agent Zero needs a local runtime. What would you like to do?' `
+                -Options @('Set up Agent Zero local runtime', 'Open Docker Desktop download page', 'Check again')
 
             if ($idx -eq -1) {
                 # Esc pressed — exit
@@ -642,13 +1070,12 @@ function check_docker {
             }
 
             if ($idx -eq 0) {
-                try {
-                    Start-Process 'https://www.docker.com/products/docker-desktop/'
-                    print_ok 'Opened Docker Desktop download page in browser.'
+                if (Complete-WindowsClientRuntimeSetup) {
+                    return
                 }
-                catch {
-                    print_warn 'Could not open browser. Please visit https://www.docker.com/products/docker-desktop/ manually.'
-                }
+            }
+            elseif ($idx -eq 1) {
+                Open-DockerDesktopDownload
             }
 
             # Check again (both after opening page or explicit "Check again")
@@ -660,6 +1087,9 @@ function check_docker {
                 print_ok "Using Docker Engine inside WSL distro '$script:WslDockerDistro'"
                 return
             }
+            if (Use-WslDockerRuntimeIfInstalled) {
+                return
+            }
         }
     }
     else {
@@ -669,6 +1099,9 @@ function check_docker {
     if (-not (check_docker_daemon_running)) {
         if (Test-WslDockerAvailable) {
             print_ok "Using Docker Engine inside WSL distro '$script:WslDockerDistro'"
+            return
+        }
+        if (Use-WslDockerRuntimeIfInstalled) {
             return
         }
         print_warn "Docker daemon is not running"
@@ -690,15 +1123,28 @@ function check_docker {
             }
         }
 
-        # Auto-start failed or timed out — show interactive retry menu
+        # Auto-start failed or timed out - offer local runtime setup as the friendly path.
         while ($true) {
-            $idx = select_from_menu -Header 'Docker is not running. Please start Docker Desktop and try again.' `
-                -Options @('Try again', 'Exit')
+            $idx = select_from_menu -Header 'Docker is not running. What would you like to do?' `
+                -Options @('Set up Agent Zero local runtime', 'Try Docker again', 'Exit')
 
-            if ($idx -eq -1 -or $idx -eq 1) {
+            if ($idx -eq -1 -or $idx -eq 2) {
                 exit 0
             }
 
+            if ($idx -eq 0) {
+                if (Complete-WindowsClientRuntimeSetup) {
+                    return
+                }
+            }
+
+            if (Test-WslDockerAvailable) {
+                print_ok "Using Docker Engine inside WSL distro '$script:WslDockerDistro'"
+                return
+            }
+            if (Use-WslDockerRuntimeIfInstalled) {
+                return
+            }
             if (check_docker_daemon_running) {
                 print_ok 'Docker daemon is running'
                 break
