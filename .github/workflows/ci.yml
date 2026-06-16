@@ -1,0 +1,16 @@
+name: Installer CI
+
+on:
+  pull_request:
+  push:
+
+jobs:
+  validate:
+    name: Validate installer scripts
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Run validation harness
+        run: bash scripts/validate.sh

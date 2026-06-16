@@ -1,9 +1,11 @@
 
 # a0-install
 
-Installation scripts for Agent Zero.
+CLI installation scripts for Agent Zero.
 
 These scripts install and manage **Agent Zero** as a **Docker** container (`agent0ai/agent-zero`) and can create multiple named instances on the same machine.
+
+Use this repository when the **A0 Launcher** GUI is unavailable, undesirable, or too heavy for the environment: SSH sessions, servers, recovery shells, scripted setup, and power-user terminals.
 
 ## Quick install (single command)
 
@@ -42,6 +44,35 @@ Run in PowerShell:
 ```powershell
 pwsh -File .\install.ps1
 ```
+
+## Noninteractive install
+
+For headless or scripted environments, Quick Start can run without menus:
+
+### macOS / Linux
+
+```bash
+bash ./install.sh --quick-start --name agent-zero --port 5080
+```
+
+### Windows PowerShell
+
+```powershell
+pwsh -File .\install.ps1 -QuickStart -Name agent-zero -Port 5080
+```
+
+Useful flags:
+
+- `--quick-start` / `-QuickStart`: create one instance with defaults and exit.
+- `--non-interactive` / `-NonInteractive`: same as Quick Start; never open menus.
+- `--yes` / `-Yes`: alias for noninteractive Quick Start.
+- `--name` / `-Name`: container and instance name.
+- `--tag` / `-Tag`: Agent Zero image tag.
+- `--port` / `-Port`: Web UI host port.
+- `--data-dir` / `-DataDir`: host data directory mounted to `/a0/usr`.
+- `--auth-login` / `-AuthLogin`: enable Web UI basic auth.
+- `--auth-password` / `-AuthPassword`: auth password; defaults to `12345678` when a login is set.
+- `--skip-runtime-setup` / `-SkipRuntimeSetup`: require an already-working Docker runtime and avoid installer-managed runtime setup.
 
 ## Prerequisites
 
@@ -121,6 +152,18 @@ Then optionally remove the local files:
 ```bash
 rm -rf ~/agent-zero
 ```
+
+## Validation
+
+The installer keeps shared defaults and runtime assumptions in `runtime-contract.json`.
+
+Run the lightweight validation harness before changing installer behavior:
+
+```bash
+bash ./scripts/validate.sh
+```
+
+It checks Bash syntax, PowerShell syntax when `pwsh` is available, the help surface, and the contract constants used by both scripts.
 
 ## Security note about one-liners
 

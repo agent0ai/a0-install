@@ -1,5 +1,24 @@
+<#
+.SYNOPSIS
+Installs and manages Dockerized Agent Zero instances from a terminal.
+
+.DESCRIPTION
+This is the CLI installer for environments where the A0 Launcher GUI is
+unavailable, undesirable, or overkill. Interactive mode uses menus. Quick Start
+and noninteractive mode create an instance from flags and exit after creation.
+#>
 param(
-    [switch]$A0ResumeRuntimeSetup
+    [switch]$A0ResumeRuntimeSetup,
+    [switch]$QuickStart,
+    [switch]$NonInteractive,
+    [switch]$Yes,
+    [string]$Name = '',
+    [string]$Tag = '',
+    [int]$Port = 0,
+    [string]$DataDir = '',
+    [string]$AuthLogin = '',
+    [string]$AuthPassword = '',
+    [switch]$SkipRuntimeSetup
 )
 
 $ErrorActionPreference = 'Stop'
@@ -16,6 +35,26 @@ $script:WslKeepAliveNoticeShown = $false
 $script:DefaultWslDistro = 'Ubuntu'
 $script:ResumeRuntimeSetup = [bool]$A0ResumeRuntimeSetup
 $script:RuntimeSetupRunOnceValue = 'AgentZeroInstallResumeRuntimeSetup'
+$script:CliNonInteractive = [bool](
+    $NonInteractive -or
+    $Yes -or
+    $QuickStart -or
+    -not [string]::IsNullOrWhiteSpace($Name) -or
+    -not [string]::IsNullOrWhiteSpace($Tag) -or
+    $Port -gt 0 -or
+    -not [string]::IsNullOrWhiteSpace($DataDir) -or
+    $PSBoundParameters.ContainsKey('AuthLogin') -or
+    $PSBoundParameters.ContainsKey('AuthPassword')
+)
+$script:CliName = $Name
+$script:CliTag = $Tag
+$script:CliPort = $Port
+$script:CliDataDir = $DataDir
+$script:CliAuthLogin = $AuthLogin
+$script:CliAuthPassword = $AuthPassword
+$script:CliAuthLoginSet = $PSBoundParameters.ContainsKey('AuthLogin')
+$script:CliAuthPasswordSet = $PSBoundParameters.ContainsKey('AuthPassword')
+$script:SkipRuntimeSetup = [bool]$SkipRuntimeSetup
 
 function Show-Banner {
     Write-Host @"
@@ -930,6 +969,12 @@ function Find-FreePort {
     return $BasePort
 }
 
+function Test-PortValue {
+    param([int]$PortValue)
+
+    return ($PortValue -ge 1 -and $PortValue -le 65535)
+}
+
 # Escape-aware text input. Reads character by character with support for:
 #   - Normal character input and Backspace for editing
 #   - Escape key to abort (returns $null)
@@ -1157,11 +1202,21 @@ function check_docker {
             print_ok "Using Docker Engine inside WSL distro '$script:WslDockerDistro'"
             return
         }
+        if ($script:SkipRuntimeSetup) {
+            Show-WindowsClientDockerGuidance
+            exit 1
+        }
         if (Use-WslDockerRuntimeIfInstalled) {
             return
         }
         if (Test-WindowsServer) {
             Show-WindowsServerDockerGuidance
+            exit 1
+        }
+        if ($script:CliNonInteractive) {
+            if (Complete-WindowsClientRuntimeSetup) {
+                return
+            }
             exit 1
         }
         if (-not (Test-InteractiveConsole)) {
@@ -1211,6 +1266,10 @@ function check_docker {
             print_ok "Using Docker Engine inside WSL distro '$script:WslDockerDistro'"
             return
         }
+        if ($script:SkipRuntimeSetup) {
+            Show-WindowsClientDockerGuidance -DaemonOnly
+            exit 1
+        }
         if (Use-WslDockerRuntimeIfInstalled) {
             return
         }
@@ -1218,6 +1277,12 @@ function check_docker {
         if (Test-WindowsServer) {
             print_error 'Docker is installed, but its daemon is not reachable.'
             print_info 'Start your Windows Server Docker endpoint or WSL2-backed Docker Engine, then rerun this installer.'
+            exit 1
+        }
+        if ($script:CliNonInteractive) {
+            if (Complete-WindowsClientRuntimeSetup) {
+                return
+            }
             exit 1
         }
         if (-not (Test-InteractiveConsole)) {
@@ -1616,6 +1681,49 @@ function create_instance {
     $defaultName = suggest_next_instance_name -BaseName 'agent-zero'
 
     $quickStart = $false
+    if ($script:CliNonInteractive) {
+        $quickStart = $true
+        $script:SelectedTag = if (-not [string]::IsNullOrWhiteSpace($script:CliTag)) { $script:CliTag } else { default_image_tag }
+        $containerName = if (-not [string]::IsNullOrWhiteSpace($script:CliName)) { $script:CliName } else { $defaultName }
+        $instanceDir = Join-Path $installRoot $containerName
+        $dataDir = if (-not [string]::IsNullOrWhiteSpace($script:CliDataDir)) { $script:CliDataDir } else { Join-Path $instanceDir 'usr' }
+        $dataDir = Expand-UserPath -PathValue $dataDir
+        $port = if ($script:CliPort -gt 0) { "$($script:CliPort)" } else { "$defaultPort" }
+        $authLogin = ''
+        $authPassword = ''
+
+        if (-not (Test-PortValue -PortValue ([int]$port))) {
+            print_error "Invalid port: $port"
+            return $false
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($script:CliName) -and (instance_name_taken -NameToCheck $containerName)) {
+            print_error "Instance name '$containerName' is already taken."
+            return $false
+        }
+
+        if ($script:CliAuthLoginSet) {
+            $authLogin = $script:CliAuthLogin
+        }
+        if ($script:CliAuthPasswordSet) {
+            if ([string]::IsNullOrWhiteSpace($authLogin)) {
+                print_error '-AuthPassword requires -AuthLogin.'
+                return $false
+            }
+            $authPassword = $script:CliAuthPassword
+        }
+        elseif (-not [string]::IsNullOrWhiteSpace($authLogin)) {
+            $authPassword = '12345678'
+        }
+
+        New-Item -ItemType Directory -Force -Path $dataDir *> $null
+        print_info 'Quick Start selected. Using:'
+        print_ok "Version:   $script:SelectedTag"
+        print_ok "Instance:  $containerName"
+        print_ok "Port:      $port"
+        print_ok "Data dir:  $dataDir"
+    }
+    else {
     $wizardStep = 0
     while ($wizardStep -ge 0 -and $wizardStep -le 6) {
         switch ($wizardStep) {
@@ -1767,6 +1875,7 @@ function create_instance {
                 $wizardStep = 7  # Done gathering input
             }
         }
+    }
     }
 
     Write-Host ''
@@ -2071,6 +2180,15 @@ function main {
     check_docker
     Clear-InstallerRuntimeSetupResume
     Write-Host ''
+
+    if ($script:CliNonInteractive) {
+        $script:CreatedContainerName = ''
+        $result = create_instance
+        if (-not $result) {
+            exit 1
+        }
+        return
+    }
 
     $existingCount = count_existing_agent_zero_containers
     if ($existingCount -lt 0) {

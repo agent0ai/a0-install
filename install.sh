@@ -33,12 +33,140 @@ EOF
     printf "%b\n" "${NC}"
 }
 
-print_banner
-
 print_ok()    { printf "  ${GREEN}✔${NC} %s\n" "$1"; }
 print_info()  { printf "${GREEN}[INFO]${NC} %s\n" "$1"; }
 print_warn()  { printf "${YELLOW}[WARN]${NC} %s\n" "$1"; }
 print_error() { printf "${RED}[ERROR]${NC} %s\n" "$1"; }
+
+A0_CLI_NON_INTERACTIVE=0
+A0_CLI_SKIP_RUNTIME_SETUP=0
+A0_CLI_NAME=""
+A0_CLI_TAG=""
+A0_CLI_PORT=""
+A0_CLI_DATA_DIR=""
+A0_CLI_AUTH_LOGIN=""
+A0_CLI_AUTH_PASSWORD=""
+A0_CLI_AUTH_LOGIN_SET=0
+A0_CLI_AUTH_PASSWORD_SET=0
+
+usage() {
+    cat <<'EOF'
+Agent Zero CLI installer
+
+Usage:
+  bash install.sh [options]
+
+Options:
+  --quick-start             Create an instance without menus, using defaults.
+  --non-interactive         Same as --quick-start; never open installer menus.
+  -y, --yes                 Alias for --non-interactive.
+  --name NAME               Container/instance name.
+  --tag TAG                 Agent Zero image tag, for example v1.20.
+  --port PORT               Web UI host port.
+  --data-dir PATH           Host data directory mounted to /a0/usr.
+  --auth-login USER         Enable Web UI basic auth with this username.
+  --auth-password PASSWORD  Auth password. Defaults to 12345678 when login is set.
+  --skip-runtime-setup      Require an already-working Docker runtime.
+  -h, --help                Show this help.
+EOF
+}
+
+require_arg_value() {
+    if [ $# -lt 2 ] || [ -z "$2" ]; then
+        print_error "$1 requires a value."
+        exit 2
+    fi
+}
+
+parse_args() {
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            --quick-start)
+                A0_CLI_NON_INTERACTIVE=1
+                ;;
+            --non-interactive|-y|--yes)
+                A0_CLI_NON_INTERACTIVE=1
+                ;;
+            --skip-runtime-setup)
+                A0_CLI_SKIP_RUNTIME_SETUP=1
+                ;;
+            --name=*)
+                A0_CLI_NAME="${1#*=}"
+                A0_CLI_NON_INTERACTIVE=1
+                ;;
+            --name)
+                require_arg_value "$1" "${2-}"
+                A0_CLI_NAME="$2"
+                A0_CLI_NON_INTERACTIVE=1
+                shift
+                ;;
+            --tag=*|--version=*)
+                A0_CLI_TAG="${1#*=}"
+                A0_CLI_NON_INTERACTIVE=1
+                ;;
+            --tag|--version)
+                require_arg_value "$1" "${2-}"
+                A0_CLI_TAG="$2"
+                A0_CLI_NON_INTERACTIVE=1
+                shift
+                ;;
+            --port=*)
+                A0_CLI_PORT="${1#*=}"
+                A0_CLI_NON_INTERACTIVE=1
+                ;;
+            --port)
+                require_arg_value "$1" "${2-}"
+                A0_CLI_PORT="$2"
+                A0_CLI_NON_INTERACTIVE=1
+                shift
+                ;;
+            --data-dir=*)
+                A0_CLI_DATA_DIR="${1#*=}"
+                A0_CLI_NON_INTERACTIVE=1
+                ;;
+            --data-dir)
+                require_arg_value "$1" "${2-}"
+                A0_CLI_DATA_DIR="$2"
+                A0_CLI_NON_INTERACTIVE=1
+                shift
+                ;;
+            --auth-login=*)
+                A0_CLI_AUTH_LOGIN="${1#*=}"
+                A0_CLI_AUTH_LOGIN_SET=1
+                A0_CLI_NON_INTERACTIVE=1
+                ;;
+            --auth-login)
+                require_arg_value "$1" "${2-}"
+                A0_CLI_AUTH_LOGIN="$2"
+                A0_CLI_AUTH_LOGIN_SET=1
+                A0_CLI_NON_INTERACTIVE=1
+                shift
+                ;;
+            --auth-password=*)
+                A0_CLI_AUTH_PASSWORD="${1#*=}"
+                A0_CLI_AUTH_PASSWORD_SET=1
+                A0_CLI_NON_INTERACTIVE=1
+                ;;
+            --auth-password)
+                require_arg_value "$1" "${2-}"
+                A0_CLI_AUTH_PASSWORD="$2"
+                A0_CLI_AUTH_PASSWORD_SET=1
+                A0_CLI_NON_INTERACTIVE=1
+                shift
+                ;;
+            *)
+                print_error "Unknown option: $1"
+                usage
+                exit 2
+                ;;
+        esac
+        shift
+    done
+}
 
 # Detect whether bash supports fractional read timeouts (bash 4+ does, bash 3.2 on macOS does not).
 HAS_FRACTIONAL_TIMEOUT=0
@@ -49,12 +177,18 @@ fi
 # Save original tty settings and restore them on exit.
 # This ensures the terminal is never left in a broken state (e.g. no echo)
 # if the script is interrupted or exits while stty is modified.
-_ORIGINAL_TTY_SETTINGS="$(stty -g </dev/tty 2>/dev/null || true)"
+_ORIGINAL_TTY_SETTINGS=""
+if [ -e /dev/tty ]; then
+    _ORIGINAL_TTY_SETTINGS="$(stty -g 2>/dev/null </dev/tty || true)"
+fi
 restore_tty() {
+    if [ ! -e /dev/tty ]; then
+        return 0
+    fi
     if [ -n "$_ORIGINAL_TTY_SETTINGS" ]; then
-        stty "$_ORIGINAL_TTY_SETTINGS" </dev/tty 2>/dev/null || true
+        stty "$_ORIGINAL_TTY_SETTINGS" 2>/dev/null </dev/tty || true
     else
-        stty sane </dev/tty 2>/dev/null || true
+        stty sane 2>/dev/null </dev/tty || true
     fi
 }
 trap restore_tty EXIT
@@ -156,6 +290,29 @@ find_free_port() {
 
     # If we exhausted attempts, return the base port and let Docker report the conflict
     printf "%d\n" "$BASE_PORT"
+}
+
+expand_user_path() {
+    case "$1" in
+        "~/"*) printf "%s\n" "$HOME/${1#~/}" ;;
+        "~") printf "%s\n" "$HOME" ;;
+        *) printf "%s\n" "$1" ;;
+    esac
+}
+
+validate_port() {
+    local _port="$1"
+    case "$_port" in
+        ''|*[!0-9]*)
+            return 1
+            ;;
+    esac
+
+    if [ "$_port" -lt 1 ] 2>/dev/null || [ "$_port" -gt 65535 ] 2>/dev/null; then
+        return 1
+    fi
+
+    return 0
 }
 
 # Character-by-character text input with pre-filled default and Escape to go back.
@@ -951,10 +1108,18 @@ check_docker() {
         OS_NAME="$(uname -s 2>/dev/null || true)"
         case "$OS_NAME" in
             Linux)
+                if [ "$A0_CLI_SKIP_RUNTIME_SETUP" -eq 1 ]; then
+                    print_error "Docker is not installed or not on PATH, and runtime setup was skipped."
+                    exit 1
+                fi
                 print_warn "Docker not found. Installing Docker Engine..."
                 install_docker_on_linux || exit 1
                 ;;
             Darwin)
+                if [ "$A0_CLI_SKIP_RUNTIME_SETUP" -eq 1 ]; then
+                    print_error "Docker is not installed or not on PATH, and runtime setup was skipped."
+                    exit 1
+                fi
                 print_warn "Docker not found. Setting up Colima runtime..."
                 ensure_macos_colima_runtime || exit 1
                 ;;
@@ -978,6 +1143,10 @@ check_docker() {
 
     if [ "$DOCKER_READY_RC" -ne 0 ]; then
         print_warn "Docker daemon is not running"
+        if [ "$A0_CLI_SKIP_RUNTIME_SETUP" -eq 1 ]; then
+            print_error "Docker daemon is not reachable, and runtime setup was skipped."
+            exit 1
+        fi
         if start_docker_daemon; then
             if ! wait_for_docker_daemon; then
                 print_error "Failed to start Docker daemon. Please start Docker manually and try again."
@@ -1290,6 +1459,48 @@ create_instance() {
     DEFAULT_NAME="$(suggest_next_instance_name "agent-zero")"
     DEFAULT_TAG="$(default_image_tag)"
     QUICK_START=0
+
+    if [ "$A0_CLI_NON_INTERACTIVE" -eq 1 ]; then
+        QUICK_START=1
+        SELECTED_TAG="${A0_CLI_TAG:-$DEFAULT_TAG}"
+        CONTAINER_NAME="${A0_CLI_NAME:-$DEFAULT_NAME}"
+        INSTANCE_DIR="$INSTALL_ROOT/$CONTAINER_NAME"
+        DATA_DIR="${A0_CLI_DATA_DIR:-$INSTANCE_DIR/usr}"
+        DATA_DIR="$(expand_user_path "$DATA_DIR")"
+        PORT="${A0_CLI_PORT:-$DEFAULT_PORT}"
+        AUTH_LOGIN=""
+        AUTH_PASSWORD=""
+
+        if ! validate_port "$PORT"; then
+            print_error "Invalid port: $PORT"
+            return 1
+        fi
+
+        if [ -n "$A0_CLI_NAME" ] && instance_name_taken "$CONTAINER_NAME"; then
+            print_error "Instance name '$CONTAINER_NAME' is already taken."
+            return 1
+        fi
+
+        if [ "$A0_CLI_AUTH_LOGIN_SET" -eq 1 ]; then
+            AUTH_LOGIN="$A0_CLI_AUTH_LOGIN"
+        fi
+        if [ "$A0_CLI_AUTH_PASSWORD_SET" -eq 1 ]; then
+            if [ -z "$AUTH_LOGIN" ]; then
+                print_error "--auth-password requires --auth-login."
+                return 1
+            fi
+            AUTH_PASSWORD="$A0_CLI_AUTH_PASSWORD"
+        elif [ -n "$AUTH_LOGIN" ]; then
+            AUTH_PASSWORD="12345678"
+        fi
+
+        mkdir -p "$DATA_DIR"
+        print_info "Quick Start selected. Using:"
+        print_ok "Version:   $SELECTED_TAG"
+        print_ok "Instance:  $CONTAINER_NAME"
+        print_ok "Port:      $PORT"
+        print_ok "Data dir:  $DATA_DIR"
+    else
     WIZARD_STEP=0
     while [ "$WIZARD_STEP" -ge 0 ] && [ "$WIZARD_STEP" -le 6 ]; do
         case "$WIZARD_STEP" in
@@ -1353,10 +1564,7 @@ create_instance() {
                 printf "${BOLD}Where should Agent Zero store user data?${NC} (Esc to go back)\n"
                 read_input "$DEFAULT_DATA_DIR" || { WIZARD_STEP=2; continue; }
                 DATA_DIR="${INPUT_VALUE:-$DEFAULT_DATA_DIR}"
-                case "$DATA_DIR" in
-                    ~/*) DATA_DIR="$HOME/${DATA_DIR#~/}" ;;
-                    ~) DATA_DIR="$HOME" ;;
-                esac
+                DATA_DIR="$(expand_user_path "$DATA_DIR")"
                 mkdir -p "$DATA_DIR"
                 print_info "Data directory: $DATA_DIR"
                 WIZARD_STEP=4
@@ -1369,12 +1577,10 @@ create_instance() {
                 printf "${BOLD}What port should Agent Zero Web UI run on?${NC} (Esc to go back)\n"
                 read_input "$DEFAULT_PORT" || { WIZARD_STEP=3; continue; }
                 PORT="${INPUT_VALUE:-$DEFAULT_PORT}"
-                case "$PORT" in
-                    ''|*[!0-9]*)
+                if ! validate_port "$PORT"; then
                     print_error "Invalid port. Falling back to ${DEFAULT_PORT}."
                     PORT="$DEFAULT_PORT"
-                    ;;
-                esac
+                fi
                 print_info "Web UI port: $PORT"
                 WIZARD_STEP=5
                 ;;
@@ -1416,6 +1622,7 @@ create_instance() {
                 ;;
         esac
     done
+    fi
 
     echo ""
     print_info "Configuration complete. Setting up Agent Zero..."
@@ -1713,6 +1920,12 @@ main() {
     check_docker
     echo ""
 
+    if [ "$A0_CLI_NON_INTERACTIVE" -eq 1 ]; then
+        CREATED_CONTAINER_NAME=""
+        create_instance
+        return
+    fi
+
     EXISTING_COUNT="$(count_existing_agent_zero_containers)"
     case "$EXISTING_COUNT" in
         ''|*[!0-9]*) EXISTING_COUNT="0" ;;
@@ -1735,4 +1948,6 @@ main() {
     fi
 }
 
-main "$@"
+parse_args "$@"
+print_banner
+main

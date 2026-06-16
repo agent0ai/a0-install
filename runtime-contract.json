@@ -1,0 +1,21 @@
+{
+  "backend": {
+    "imageRepository": "agent0ai/agent-zero",
+    "releaseRepository": "agent0ai/agent-zero",
+    "stableTagPattern": "^v[0-9]+\\.[0-9]+(\\.[0-9]+)?$",
+    "defaultTagFallback": "latest"
+  },
+  "instance": {
+    "defaultName": "agent-zero",
+    "defaultPort": 5080,
+    "defaultInstallRoot": "~/agent-zero",
+    "dataMount": "/a0/usr",
+    "managedLabel": "ai.agent0.managed=true"
+  },
+  "runtime": {
+    "linuxDockerPackage": "docker.io",
+    "macosColimaProfile": "a0",
+    "windowsDefaultWslDistro": "Ubuntu",
+    "windowsWslDockerMode": "direct-wsl-cli"
+  }
+}
