@@ -315,17 +315,38 @@ function Test-WslCommandOk {
     )
 
     try {
-        $wslArgs = @()
-        if (-not [string]::IsNullOrWhiteSpace($Distro)) {
-            $wslArgs += @('-d', $Distro)
-        }
-        $wslArgs += @('--exec', 'sh', '-lc', $Script)
-        & wsl.exe @wslArgs *> $null
+        Invoke-WslShell -Distro $Distro -Script $Script *> $null
         return ($LASTEXITCODE -eq 0)
     }
     catch {
         return $false
     }
+}
+
+function Convert-ToWslShellCommand {
+    param([string]$Script)
+
+    $normalizedScript = ($Script -replace "`r`n", "`n") -replace "`r", "`n"
+    $encodedScript = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($normalizedScript))
+    return "printf '%s' '$encodedScript' | base64 -d | sh"
+}
+
+function Invoke-WslShell {
+    param(
+        [string]$Distro,
+        [string]$Script,
+        [switch]$Root
+    )
+
+    $wslArgs = @()
+    if (-not [string]::IsNullOrWhiteSpace($Distro)) {
+        $wslArgs += @('-d', $Distro)
+    }
+    if ($Root) {
+        $wslArgs += @('-u', 'root')
+    }
+    $wslArgs += @('--exec', 'sh', '-lc', (Convert-ToWslShellCommand -Script $Script))
+    & wsl.exe @wslArgs
 }
 
 function Test-WslRootCommandOk {
@@ -335,12 +356,7 @@ function Test-WslRootCommandOk {
     )
 
     try {
-        $wslArgs = @()
-        if (-not [string]::IsNullOrWhiteSpace($Distro)) {
-            $wslArgs += @('-d', $Distro)
-        }
-        $wslArgs += @('-u', 'root', '--exec', 'sh', '-lc', $Script)
-        & wsl.exe @wslArgs *> $null
+        Invoke-WslShell -Distro $Distro -Script $Script -Root *> $null
         return ($LASTEXITCODE -eq 0)
     }
     catch {
@@ -354,12 +370,7 @@ function Invoke-WslRootShell {
         [string]$Script
     )
 
-    $wslArgs = @()
-    if (-not [string]::IsNullOrWhiteSpace($Distro)) {
-        $wslArgs += @('-d', $Distro)
-    }
-    $wslArgs += @('-u', 'root', '--exec', 'sh', '-lc', $Script)
-    & wsl.exe @wslArgs
+    Invoke-WslShell -Distro $Distro -Script $Script -Root
 }
 
 function Get-UbuntuLauncherBinary {
@@ -807,7 +818,7 @@ function Test-WslDockerAvailable {
     foreach ($candidate in (Get-WslDistroCandidates)) {
         $distro = "$($candidate.Name)"
         try {
-            & wsl.exe -d $distro --exec sh -lc 'docker info >/dev/null 2>&1'
+            Invoke-WslShell -Distro $distro -Script 'docker info >/dev/null 2>&1' *> $null
             if ($LASTEXITCODE -eq 0) {
                 $script:DockerMode = 'wsl'
                 $script:DockerHostArgs = @()
