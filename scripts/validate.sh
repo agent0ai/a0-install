@@ -11,6 +11,22 @@ echo "Checking Bash help surface..."
 bash install.sh --help | grep -q -- "--quick-start"
 bash install.sh --help | grep -q -- "--skip-runtime-setup"
 
+echo "Checking Bash path expansion..."
+grep -Fq '${1#\~/}' install.sh
+bash -c '
+    input="~/agent-zero/test"
+    test "$HOME/${input#\~/}" = "$HOME/agent-zero/test"
+'
+
+echo "Checking Bash menu clear handling..."
+UNGUARDED_CLEAR="$(
+    grep -nE '^[[:space:]]*clear([[:space:]]*(>|$))' install.sh | grep -vF '|| true' || true
+)"
+if [ -n "$UNGUARDED_CLEAR" ]; then
+    printf '%s\n' "$UNGUARDED_CLEAR" >&2
+    exit 1
+fi
+
 if command -v pwsh >/dev/null 2>&1; then
     echo "Checking PowerShell syntax..."
     pwsh -NoProfile -Command '

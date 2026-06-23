@@ -297,7 +297,7 @@ find_free_port() {
 
 expand_user_path() {
     case "$1" in
-        "~/"*) printf "%s\n" "$HOME/${1#~/}" ;;
+        "~/"*) printf "%s\n" "$HOME/${1#\~/}" ;;
         "~") printf "%s\n" "$HOME" ;;
         *) printf "%s\n" "$1" ;;
     esac
@@ -493,7 +493,7 @@ select_from_menu() {
 
     while :; do
         # Clear screen
-        clear >/dev/tty 2>&1
+        clear >/dev/tty 2>&1 || true
         print_banner >/dev/tty
 
         # Display header if provided
@@ -1721,7 +1721,7 @@ create_instance() {
                 ;;
 
             2)  # Container / instance name
-                clear
+                clear >/dev/tty 2>&1 || true
                 print_banner
                 echo ""
                 printf "${BOLD}What should this instance be called?${NC} (Esc to go back)\n"
@@ -1741,7 +1741,7 @@ create_instance() {
                 INSTANCE_DIR="$INSTALL_ROOT/$CONTAINER_NAME"
                 DEFAULT_DATA_DIR="$INSTANCE_DIR/usr"
 
-                clear
+                clear >/dev/tty 2>&1 || true
                 print_banner
                 echo ""
                 printf "${BOLD}Where should Agent Zero store user data?${NC} (Esc to go back)\n"
@@ -1754,7 +1754,7 @@ create_instance() {
                 ;;
 
             4)  # Port
-                clear
+                clear >/dev/tty 2>&1 || true
                 print_banner
                 echo ""
                 printf "${BOLD}What port should Agent Zero Web UI run on?${NC} (Esc to go back)\n"
@@ -1769,7 +1769,7 @@ create_instance() {
                 ;;
 
             5)  # Auth username
-                clear
+                clear >/dev/tty 2>&1 || true
                 print_banner
                 echo ""
                 if [ "$QUICK_START" = "1" ]; then
@@ -1794,7 +1794,7 @@ create_instance() {
                 ;;
 
             6)  # Auth password (only reached if username was provided)
-                clear
+                clear >/dev/tty 2>&1 || true
                 print_banner
                 echo ""
                 printf "${BOLD}What password should be used?${NC} (Esc to go back)\n"
@@ -1859,7 +1859,7 @@ manage_instances() {
 
         while :; do
             # Clear screen
-            clear
+            clear >/dev/tty 2>&1 || true
             print_banner >/dev/tty
 
             # Display header
