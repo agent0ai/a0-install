@@ -89,7 +89,9 @@ Notes:
 
 ## What the installer does
 
-Both `install.sh` and `install.ps1` use the Agent Zero CLI logo, switching to its compact symbol in narrow terminals. They implement the same flow:
+Both `install.sh` and `install.ps1` use the Agent Zero CLI logo, switching to its compact symbol in narrow terminals. On interactive startup, its blocks appear in a random order over about half a second. Menu redraws, noninteractive runs, and unsupported or very short terminals use the static logo. Setting `NO_COLOR` also skips the animation.
+
+They implement the same flow:
 
 - Detect existing Agent Zero containers (`agent0ai/agent-zero`).
 - If none exist, start the **create instance** flow.
@@ -192,7 +194,7 @@ Run the lightweight validation harness before changing installer behavior:
 bash ./scripts/validate.sh
 ```
 
-It checks Bash syntax, PowerShell syntax when `pwsh` is available, the help surface, and the contract constants used by both scripts. It also runs fixture-based import tests and terminal interaction tests with Python's standard library and a fake Docker CLI. These cover responsive banner widths, discovery, silent skips, one-time decisions, checkbox keys, shared links, protected destinations, selection boundaries, background downloads and cancellation. PowerShell behavior tests run when `pwsh` is available; native Windows/WSL and macOS testing remains a separate platform check.
+It checks Bash syntax, PowerShell syntax when `pwsh` is available, the help surface, and the contract constants used by both scripts. It also runs fixture-based import tests and terminal interaction tests with Python's standard library and a fake Docker CLI. These cover responsive banner widths and startup animation, discovery, silent skips, one-time decisions, checkbox keys, shared links, protected destinations, selection boundaries, background downloads and cancellation. PowerShell behavior tests run when `pwsh` is available; native Windows/WSL and macOS testing remains a separate platform check.
 
 ## Security note about one-liners
 

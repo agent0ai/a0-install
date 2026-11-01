@@ -19,17 +19,18 @@ YELLOW='\033[1;33m'
 BLUE='\033[38;2;0;180;255m'
 BOLD='\033[1m'
 NC='\033[0m' # No Color
+_BANNER_ANIMATING=0
 
 print_banner() {
-    local size width
+    local size width height banner
     size=$(stty size 2>/dev/null </dev/tty) || size=""
     width=${size##* }
+    height=${size%% *}
     case "$width" in ''|*[!0-9]*|0) width=80 ;; esac
     [ "$width" -ge 13 ] || return 0
 
-    printf "%b" "${BLUE}"
     if [ "$width" -ge 43 ]; then
-        cat <<'EOF'
+        banner=$(cat <<'EOF'
               ▄▀▀▀▄ ▄▀▀▀▀ ▄▀▀▀▀ ▀▄  ▄ ▀▀█▀▀
      ▄█▄      ▄▀▀▀█ ▄ ▀▀█ █▀▀ ▄ █ ▀▄█   █
    ▄█▀ ▀█▄    ▀   ▀  ▀▀▀▀  ▀▀▀▀ ▀   ▀   ▀
@@ -37,15 +38,55 @@ print_banner() {
 ▀▀  ▀▀▀▀▀  ▀▀     ▄▀▀  █▀▀   █▀▀▀▄ █   █
                  ▀▀▀▀▀  ▀▀▀▀ ▀   ▀  ▀▀▀
 EOF
+        )
     else
-        cat <<'EOF'
+        banner=$(cat <<'EOF'
       ▄
     ▄█▀█▄
   ▄█▀   ▀█▄
 ▄█▀ ▄▄▄▄▄ ▀█▄
 EOF
+        )
     fi
-    printf "%b\n" "${NC}"
+    if [ "${1-}" = --animate ] && [ "$A0_CLI_NON_INTERACTIVE" -eq 0 ] && [ -t 1 ] && [ -z "${NO_COLOR-}" ]; then
+        case "${TERM-}" in
+            xterm*|screen*|tmux*|rxvt*|linux|vt100|vt220|ansi|cygwin|putty*)
+                if [ -n "$height" ] && [ "$height" -gt 7 ]; then
+                    reveal_banner "$banner"
+                    return
+                fi ;;
+        esac
+    fi
+    printf '%b%s%b\n\n' "$BLUE" "$banner" "$NC"
+}
+
+reveal_banner() {
+    local banner="$1" encoded line rows=0 i frame glyph output ranks=()
+    # ASCII masks keep the block glyphs intact even under a non-UTF-8 locale.
+    encoded=${banner//▄/d}; encoded=${encoded//▀/u}; encoded=${encoded//█/b}
+    while IFS= read -r line; do rows=$((rows + 1)); done <<< "$banner"
+    for ((i=0; i<${#encoded}; i++)); do ranks[i]=$((RANDOM % 10 + 1)); done
+    _BANNER_ANIMATING=1
+    printf '\033[?25l'
+    for ((i=0; i<rows; i++)); do printf '\n'; done
+    for ((frame=1; frame<=10; frame++)); do
+        output=""
+        for ((i=0; i<${#encoded}; i++)); do
+            glyph=${encoded:i:1}
+            case "$glyph" in
+                d|u|b)
+                    if [ "${ranks[i]}" -gt "$frame" ]; then glyph=' '
+                    else
+                        case "$glyph" in d) glyph='▄' ;; u) glyph='▀' ;; b) glyph='█' ;; esac
+                    fi ;;
+            esac
+            output="$output$glyph"
+        done
+        printf '\033[%dA\r%b%s\n' "$rows" "$BLUE" "$output"
+        sleep 0.045 2>/dev/null || true
+    done
+    printf '%b\033[?25h\n' "$NC"
+    _BANNER_ANIMATING=0
 }
 
 print_ok()    { printf "  ${GREEN}✔${NC} %s\n" "$1"; }
@@ -198,6 +239,10 @@ if [ -e /dev/tty ]; then
     _ORIGINAL_TTY_SETTINGS="$(stty -g 2>/dev/null </dev/tty || true)"
 fi
 restore_tty() {
+    if [ "$_BANNER_ANIMATING" -eq 1 ]; then
+        printf '%b\033[?25h\n' "$NC" 2>/dev/null >/dev/tty || true
+        _BANNER_ANIMATING=0
+    fi
     if [ ! -e /dev/tty ]; then
         return 0
     fi
@@ -2458,5 +2503,5 @@ main() {
 }
 
 parse_args "$@"
-print_banner
+print_banner --animate
 main

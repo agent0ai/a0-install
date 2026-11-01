@@ -61,6 +61,8 @@ $script:CliAuthPasswordSet = $PSBoundParameters.ContainsKey('AuthPassword')
 $script:SkipRuntimeSetup = [bool]$SkipRuntimeSetup
 
 function Show-Banner {
+    param([switch]$Animate)
+
     $width = 80
     try { if ([Console]::WindowWidth -gt 0) { $width = [Console]::WindowWidth } } catch { }
     if ($width -lt 13) { return }
@@ -85,7 +87,25 @@ function Show-Banner {
     }
     if ($Host.UI.SupportsVirtualTerminal) {
         $escape = [char]27
-        Write-Host "${escape}[38;2;0;180;255m$banner${escape}[0m"
+        if ($Animate -and -not $script:CliNonInteractive -and -not $env:NO_COLOR -and -not [Console]::IsOutputRedirected -and
+            (Test-InteractiveConsole) -and [Console]::WindowHeight -gt 7) {
+            $rows = ($banner -split "`n").Count
+            $random = [Random]::new()
+            $ranks = @(foreach ($glyph in $banner.ToCharArray()) { $random.Next(1, 11) })
+            try {
+                [Console]::Write("${escape}[?25l" + "`n" * $rows)
+                for ($frame = 1; $frame -le 10; $frame++) {
+                    $output = $banner.ToCharArray()
+                    for ($i = 0; $i -lt $output.Length; $i++) {
+                        if ($ranks[$i] -gt $frame -and $output[$i] -in @('▄', '▀', '█')) { $output[$i] = ' ' }
+                    }
+                    [Console]::WriteLine("${escape}[${rows}A`r${escape}[38;2;0;180;255m$(-join $output)")
+                    Start-Sleep -Milliseconds 45
+                }
+            }
+            finally { [Console]::Write("${escape}[0m${escape}[?25h") }
+        }
+        else { Write-Host "${escape}[38;2;0;180;255m$banner${escape}[0m" }
     }
     else { Write-Host $banner -ForegroundColor Cyan }
     Write-Host ''
@@ -2760,5 +2780,5 @@ function main {
     }
 }
 
-Show-Banner
+Show-Banner -Animate
 main

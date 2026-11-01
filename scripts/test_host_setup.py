@@ -32,7 +32,7 @@ class HostSetupTests(unittest.TestCase):
         self.host.mkdir()
         self.data.mkdir()
         self.env = os.environ.copy()
-        for name in ("CODEX_HOME", "CLAUDE_CONFIG_DIR", "XDG_CONFIG_HOME", "HERMES_HOME"):
+        for name in ("CODEX_HOME", "CLAUDE_CONFIG_DIR", "XDG_CONFIG_HOME", "HERMES_HOME", "NO_COLOR"):
             self.env.pop(name, None)
         self.env.update(A0_TEST_HOME=str(self.host), A0_TEST_DATA=str(self.data), TERM="xterm")
         self.bash = self.root / "functions.sh"
@@ -42,7 +42,7 @@ class HostSetupTests(unittest.TestCase):
         bash_source = bash_source.replace('choose_host_setup "$DATA_DIR" "$HOME"', 'choose_host_setup "$DATA_DIR" "$A0_TEST_HOME"')
         self.bash.write_text(bash_source)
         self.ps = self.root / "functions.ps1"
-        self.ps.write_text((ROOT / "install.ps1").read_text().rsplit("\nShow-Banner\nmain", 1)[0])
+        self.ps.write_text((ROOT / "install.ps1").read_text().rsplit("\nShow-Banner -Animate\nmain", 1)[0])
 
     def write(self, relative, content="fixture"):
         path = self.host / relative
@@ -162,6 +162,60 @@ class HostSetupTests(unittest.TestCase):
                         self.assertEqual(lines, rendered[key])
             plain = ansi.sub("", self.run_code(language, code))
             self.assertEqual(len([line for line in plain.splitlines() if line.strip()]), 6)
+
+    def test_banner_reveal_completes_in_place(self):
+        self.env["LC_ALL"] = "C"
+        ansi = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|[=>])")
+        for language, static, animated in (("bash", "print_banner", "print_banner --animate"),
+                                           ("pwsh", "Show-Banner", "Show-Banner -Animate")):
+            for width in (80, 40):
+                with self.subTest(language=language, width=width):
+                    _, expected = self.run_tty(language, static, size=(24, width))
+                    expected = ansi.sub("", expected).replace("\r", "").strip("\n")
+                    status, output = self.run_tty(language, animated + "\n" + static, size=(24, width))
+                    self.assertEqual(status, 0, output)
+                    self.assertEqual(output.count("\x1b[?25l"), 1)
+                    self.assertEqual(output.count("\x1b[?25h"), 1)
+                    chunks = re.split(r"\x1b\[\d+A\r\x1b\[38;2;0;180;255m", output)[1:]
+                    frames = [chunk.split("\x1b", 1)[0].replace("\r", "").rstrip("\n") for chunk in chunks]
+                    self.assertEqual(len(frames), 10, output)
+                    self.assertEqual(frames[-1], expected)
+                    self.assertNotEqual(frames[0], expected)
+                    previous = " " * len(expected)
+                    for frame in frames:
+                        self.assertEqual(len(frame), len(expected))
+                        for before, current, final in zip(previous, frame, expected):
+                            self.assertIn(current, (" ", final))
+                            if before != " ":
+                                self.assertEqual(current, before)
+                        previous = frame
+
+    def test_banner_reveal_static_fallbacks(self):
+        for language, call, noninteractive in (
+            ("bash", "print_banner --animate", "A0_CLI_NON_INTERACTIVE=1"),
+            ("pwsh", "Show-Banner -Animate", "$script:CliNonInteractive=$true"),
+        ):
+            for mode in ("noninteractive", "dumb", "short", "redirected", "no-color"):
+                with self.subTest(language=language, mode=mode):
+                    self.env["TERM"] = "dumb" if mode == "dumb" else "xterm"
+                    self.env["NO_COLOR"] = "1" if mode == "no-color" else ""
+                    code = (noninteractive + "\n" if mode == "noninteractive" else "") + call
+                    if mode == "redirected":
+                        output = self.run_code(language, code)
+                    else:
+                        status, output = self.run_tty(language, code, size=(7 if mode == "short" else 24, 80))
+                        self.assertEqual(status, 0, output)
+                    self.assertNotIn("\x1b[?25l", output)
+                    self.assertNotRegex(output, r"\x1b\[\d+A")
+                    self.assertIn("▄█▀     ▀█▄", output)
+
+    def test_banner_reveal_cancel_restores_cursor(self):
+        for language, code in (("bash", "print_banner --animate\necho UNEXPECTED_RESUME"),
+                               ("pwsh", "Show-Banner -Animate\nWrite-Host UNEXPECTED_RESUME")):
+            with self.subTest(language=language):
+                _, output = self.run_tty(language, code, [("\x1b[?25l", b"\x03")])
+                self.assertNotIn("UNEXPECTED_RESUME", output)
+                self.assertIn("\x1b[?25h", output)
 
     def import_code(self, language):
         if language == "bash":
