@@ -61,14 +61,34 @@ $script:CliAuthPasswordSet = $PSBoundParameters.ContainsKey('AuthPassword')
 $script:SkipRuntimeSetup = [bool]$SkipRuntimeSetup
 
 function Show-Banner {
-    Write-Host @"
- █████╗   ██████╗ ███████╗███╗   ██╗████████╗   ███████╗███████╗██████╗  ██████╗ 
-██╔══██╗ ██╔════╝ ██╔════╝████╗  ██║╚══██╔══╝   ╚══███╔╝██╔════╝██╔══██╗██╔═══██╗
-███████║ ██║  ███╗█████╗  ██╔██╗ ██║   ██║        ███╔╝ █████╗  ██████╔╝██║   ██║
-██╔══██║ ██║   ██║██╔══╝  ██║╚██╗██║   ██║       ███╔╝  ██╔══╝  ██╔══██╗██║   ██║
-██║  ██║ ╚██████╔╝███████╗██║ ╚████║   ██║      ███████╗███████╗██║  ██║╚██████╔╝
-╚═╝  ╚═╝  ╚═════╝ ╚══════╝╚═╝  ╚═══╝   ╚═╝      ╚══════╝╚══════╝╚═╝  ╚═╝ ╚═════╝ 
-"@ -ForegroundColor Blue
+    $width = 80
+    try { if ([Console]::WindowWidth -gt 0) { $width = [Console]::WindowWidth } } catch { }
+    if ($width -lt 13) { return }
+
+    $banner = if ($width -ge 43) {
+@'
+              ▄▀▀▀▄ ▄▀▀▀▀ ▄▀▀▀▀ ▀▄  ▄ ▀▀█▀▀
+     ▄█▄      ▄▀▀▀█ ▄ ▀▀█ █▀▀ ▄ █ ▀▄█   █
+   ▄█▀ ▀█▄    ▀   ▀  ▀▀▀▀  ▀▀▀▀ ▀   ▀   ▀
+ ▄█▀     ▀█▄     ▀▀▀▀▄ ▄▀▀▀▀ █▀▀▀▄ ▄▀▀▀▄
+▀▀  ▀▀▀▀▀  ▀▀     ▄▀▀  █▀▀   █▀▀▀▄ █   █
+                 ▀▀▀▀▀  ▀▀▀▀ ▀   ▀  ▀▀▀
+'@
+    }
+    else {
+@'
+      ▄
+    ▄█▀█▄
+  ▄█▀   ▀█▄
+▄█▀ ▄▄▄▄▄ ▀█▄
+'@
+    }
+    if ($Host.UI.SupportsVirtualTerminal) {
+        $escape = [char]27
+        Write-Host "${escape}[38;2;0;180;255m$banner${escape}[0m"
+    }
+    else { Write-Host $banner -ForegroundColor Cyan }
+    Write-Host ''
 }
 
 function print_ok {

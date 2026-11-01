@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import pty
+import re
 import select
 import shlex
 import shutil
@@ -95,12 +96,12 @@ class HostSetupTests(unittest.TestCase):
         self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
         return result.stdout
 
-    def run_tty(self, language, code, actions=(), timeout=12):
+    def run_tty(self, language, code, actions=(), timeout=12, size=(24, 100)):
         command = self.runner(language, code)
         pid, fd = pty.fork()
         if pid == 0:
             os.execvpe(command[0], command, self.env)
-        fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", *size, 0, 0))
         output = b""
         pending = list(actions)
         deadline = time.monotonic() + timeout
@@ -138,6 +139,29 @@ class HostSetupTests(unittest.TestCase):
                     pass
                 os.waitpid(pid, 0)
             os.close(fd)
+
+    def test_responsive_banner(self):
+        ansi = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|[=>])")
+        rendered = {}
+        for language, code in (("bash", "print_banner"), ("pwsh", "Show-Banner")):
+            for rows, columns, expected_rows in ((24, 80, 6), (24, 43, 6), (24, 42, 4),
+                                                (24, 13, 4), (24, 12, 0), (12, 80, 6)):
+                with self.subTest(language=language, rows=rows, columns=columns):
+                    status, output = self.run_tty(language, code, size=(rows, columns))
+                    self.assertEqual(status, 0, output)
+                    plain = ansi.sub("", output)
+                    lines = [line for line in plain.splitlines() if line.strip()]
+                    self.assertEqual(len(lines), expected_rows, plain)
+                    self.assertTrue(all(len(line) <= columns for line in lines), plain)
+                    if expected_rows == 4:
+                        self.assertEqual(lines[-1], "▄█▀ ▄▄▄▄▄ ▀█▄")
+                    key = (rows, columns)
+                    if language == "bash":
+                        rendered[key] = lines
+                    else:
+                        self.assertEqual(lines, rendered[key])
+            plain = ansi.sub("", self.run_code(language, code))
+            self.assertEqual(len([line for line in plain.splitlines() if line.strip()]), 6)
 
     def import_code(self, language):
         if language == "bash":
