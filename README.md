@@ -108,11 +108,38 @@ When you create a new instance, the installer will prompt you for:
 - **Web UI port** (default: first free port starting at `5080`)
 - Optional **basic auth** (username; password defaults to `12345678`)
 
-Then it:
+The image download starts as soon as the version is chosen, while you answer the remaining questions. Then the installer:
 
-- Pulls the image
+- Offers to import an existing agent setup, if supported content is found
+- Finishes the image download
+- Copies any imports you selected
 - Starts the container directly with Docker
 - Waits for the UI to respond (tries `http://localhost:<port>`)
+
+### Bring your existing setup
+
+Interactive installations look for useful content in these user directories. Empty or missing directories produce **no import prompt**.
+
+| Harness | Default directory | Selectable content, when present |
+| --- | --- | --- |
+| Shared agents | `~/.agents` | Skills, `AGENTS.md` |
+| [Claude Code](https://code.claude.com/docs/en/skills) | `~/.claude` | Skills, instructions, rules, agents, commands, settings |
+| [Codex](https://developers.openai.com/codex/build-skills) | `~/.codex` | Skills, instructions, rules, agents, prompts, config |
+| [Cursor](https://cursor.com/docs/skills) | `~/.cursor` | Skills, instructions, rules, commands, MCP and CLI config |
+| [Gemini CLI](https://geminicli.com/docs/cli/tutorials/skills-getting-started/) | `~/.gemini` | Skills, instructions, commands, settings |
+| [OpenCode](https://opencode.ai/docs/skills/) | `~/.config/opencode` | Skills, instructions, agents, commands, config |
+| Hermes | `~/.hermes` | Skills, `SOUL.md`, `memories/MEMORY.md`, `memories/USER.md`, config |
+
+Detection also respects `CODEX_HOME`, `CLAUDE_CONFIG_DIR`, `XDG_CONFIG_HOME` and `HERMES_HOME`. It scans the invoking user's directories, not project trees or other users' accounts. The Windows installer scans the Windows profile; it does not search WSL distributions for agent settings.
+
+The offer opens a paged checkbox list, grouped by harness. **Arrow keys** move, **Space** toggles, **Enter** reviews, and **Escape** skips the import. Nothing is selected by default. Each highlighted item shows its source and destination; a final confirmation precedes copying. Download output stays in a temporary log so it cannot interrupt the questions.
+
+- **Skills** are copied to `usr/skills/imported/<harness>/<skill-folder>`, where Agent Zero discovers them. Scripts and supporting files are retained. Names remain unchanged, so Agent Zero's normal priority rules apply when skills share a name. Harness-specific tools, host paths or dependencies may still need adaptation.
+- **Instructions, rules, memories and configuration** are saved under `usr/imports/<harness>`, with a `.reference` suffix on every file. They are reference copies, not translated Agent Zero settings. Hooks, MCP servers and foreign system instructions are not enabled automatically.
+- **Configuration can contain inline credentials.** Selecting a config copies those values too. The reference files become part of the instance's user data and backups and can be read by its agents. Review or redact them locally before asking an agent to read them. Dedicated credential stores, chat history and session databases are not offered.
+- Existing destination files or groups are kept, without merging or overwriting. Shared skill links inside the detected skill roots are resolved and copied once per import. Links outside those roots, embedded links, dependency directories, caches, `.env` files and private-key files are skipped.
+
+The decision is recorded once per data directory in `usr/.a0-install/host-setup-v1`, after a successful download and import or deliberate skip. Reusing that data directory does not ask again; a new instance with a new directory gets its own choice. Interrupted or failed downloads do not record a decision. Noninteractive flags never open the import dialog or copy host setup files, and do not record an import decision.
 
 ### Where files are stored
 
@@ -165,7 +192,7 @@ Run the lightweight validation harness before changing installer behavior:
 bash ./scripts/validate.sh
 ```
 
-It checks Bash syntax, PowerShell syntax when `pwsh` is available, the help surface, and the contract constants used by both scripts.
+It checks Bash syntax, PowerShell syntax when `pwsh` is available, the help surface, and the contract constants used by both scripts. It also runs fixture-based import tests and terminal interaction tests with Python's standard library and a fake Docker CLI. These cover discovery, silent skips, one-time decisions, checkbox keys, shared links, protected destinations, selection boundaries, background downloads and cancellation. PowerShell behavior tests run when `pwsh` is available; native Windows/WSL and macOS testing remains a separate platform check.
 
 ## Security note about one-liners
 

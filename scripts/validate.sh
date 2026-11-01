@@ -102,4 +102,7 @@ if missing:
     raise SystemExit("\n".join(missing))
 PY
 
+echo "Checking host setup import and onboarding..."
+python3 scripts/test_host_setup.py
+
 echo "Installer validation passed."

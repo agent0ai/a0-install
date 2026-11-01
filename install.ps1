@@ -94,7 +94,7 @@ function print_error {
 function Wait-ForKeypress {
     Write-Host ''
     Write-Host 'Press any key to continue...' -NoNewline
-    $null = [Console]::ReadKey($true)
+    $null = Read-InstallerKey
     Write-Host ''
 }
 
@@ -106,6 +106,19 @@ function Test-InteractiveConsole {
     catch {
         return $false
     }
+}
+
+function Read-InstallerKey {
+    $previous = [Console]::TreatControlCAsInput
+    try {
+        [Console]::TreatControlCAsInput = $true
+        $key = [Console]::ReadKey($true)
+        if ($key.Key -eq 'C' -and ($key.Modifiers -band [ConsoleModifiers]::Control)) {
+            throw [OperationCanceledException]::new('Installation cancelled.')
+        }
+        return $key
+    }
+    finally { [Console]::TreatControlCAsInput = $previous }
 }
 
 function Test-WindowsServer {
@@ -1170,7 +1183,7 @@ function Read-InputWithEscape {
     }
 
     while ($true) {
-        $keyInfo = [Console]::ReadKey($true)
+        $keyInfo = Read-InstallerKey
 
         # Handle Enter key
         if ($keyInfo.Key -eq 'Enter') {
@@ -1245,7 +1258,7 @@ function select_from_menu {
     # Flush any buffered keypresses so stale input doesn't auto-select an option
     try {
         while ([Console]::KeyAvailable) {
-            [void][Console]::ReadKey($true)
+            $null = Read-InstallerKey
         }
     }
     catch {
@@ -1274,7 +1287,7 @@ function select_from_menu {
         Write-Host ''
         Write-Host 'Use arrow keys to navigate, Enter to select, Esc to go back'
 
-        $keyInfo = [Console]::ReadKey($true)
+        $keyInfo = Read-InstallerKey
         switch ($keyInfo.Key) {
             'Enter' {
                 return $selectedIndex
@@ -1298,6 +1311,327 @@ function select_from_menu {
                 }
             }
         }
+    }
+}
+
+function select_checkboxes {
+    param([string]$Header, [string[]]$Options, [string[]]$Details = @())
+
+    if (-not $Options -or -not (Test-InteractiveConsole)) { return }
+    $checked = @($Options | ForEach-Object { $false })
+    $cursor = 0
+    while ($true) {
+        $pageSize = [Math]::Max(3, [Console]::WindowHeight - 15)
+        $first = [int][Math]::Floor($cursor / $pageSize) * $pageSize
+        $last = [Math]::Min($first + $pageSize, $Options.Count)
+        Clear-Host
+        Write-Host "$Header`n"
+        for ($i = $first; $i -lt $last; $i++) {
+            $mark = if ($checked[$i]) { 'x' } else { ' ' }
+            $pointer = if ($i -eq $cursor) { '>' } else { ' ' }
+            if ($i -eq $cursor) { Write-Host " $pointer [$mark] $($Options[$i])" -ForegroundColor Green }
+            else { Write-Host " $pointer [$mark] $($Options[$i])" }
+        }
+        if ($Details.Count -gt $cursor) { Write-Host "`n$($Details[$cursor])" }
+        Write-Host "`nItems $($first + 1)-$last of $($Options.Count)"
+        Write-Host 'Arrow keys navigate  Space toggles  Enter reviews  Esc skips'
+        $keyInfo = Read-InstallerKey
+        switch ($keyInfo.Key) {
+            'Enter' {
+                for ($i = 0; $i -lt $Options.Count; $i++) { if ($checked[$i]) { $i } }
+                return
+            }
+            'Spacebar' { $checked[$cursor] = -not $checked[$cursor] }
+            'Escape' { return }
+            'Backspace' { return }
+            'UpArrow' { $cursor = ($cursor + $Options.Count - 1) % $Options.Count }
+            'DownArrow' { $cursor = ($cursor + 1) % $Options.Count }
+        }
+    }
+}
+
+$script:ImagePull = $null
+function Stop-ImagePull {
+    if ($script:ImagePull) {
+        try {
+            if (-not $script:ImagePull.Process.HasExited) {
+                $script:ImagePull.Process.Kill()
+                $script:ImagePull.Process.WaitForExit()
+            }
+        }
+        finally {
+            $script:ImagePull.Process.Dispose()
+            Remove-Item -LiteralPath $script:ImagePull.Log, $script:ImagePull.ErrorLog -Force -ErrorAction SilentlyContinue
+            $script:ImagePull = $null
+        }
+    }
+}
+
+function Start-ImagePull {
+    param([string]$ImageTag)
+
+    $image = "agent0ai/agent-zero:$ImageTag"
+    if ($script:ImagePull -and $script:ImagePull.Image -eq $image) { return }
+    Stop-ImagePull
+    $command = 'docker'
+    $arguments = @($script:DockerHostArgs)
+    if ($script:DockerMode -eq 'wsl') {
+        $command = 'wsl.exe'
+        $arguments = @()
+        if ($script:WslDockerDistro) { $arguments += @('-d', $script:WslDockerDistro) }
+        $arguments += @('--exec', 'docker')
+    }
+    $arguments += @('pull', '--quiet', $image)
+    $log = [IO.Path]::GetTempFileName()
+    $errorLog = [IO.Path]::GetTempFileName()
+    try {
+        $process = Start-Process -FilePath (Get-Command $command -ErrorAction Stop).Source `
+            -ArgumentList (($arguments | ForEach-Object { Convert-ToWindowsCommandArg $_ }) -join ' ') `
+            -NoNewWindow -PassThru -RedirectStandardOutput $log -RedirectStandardError $errorLog
+        $script:ImagePull = @{ Process = $process; Image = $image; Log = $log; ErrorLog = $errorLog }
+    }
+    catch {
+        Remove-Item -LiteralPath $log, $errorLog -Force -ErrorAction SilentlyContinue
+        throw
+    }
+}
+
+function Complete-ImagePull {
+    print_info 'Waiting for the Agent Zero image download...'
+    try {
+        $script:ImagePull.Process.WaitForExit()
+        if ($script:ImagePull.Process.ExitCode -ne 0) {
+            Get-Content -LiteralPath $script:ImagePull.ErrorLog | ForEach-Object { print_error $_ }
+            throw 'Could not download the Agent Zero image.'
+        }
+    }
+    finally { Stop-ImagePull }
+}
+
+function Test-HostSetupExcluded {
+    param([string]$Name)
+    return ($Name -in @('.git', '.svn', '.hg', 'node_modules', '.venv', 'venv', '__pycache__', '.cache',
+        '.env', '.ssh', '.gnupg', 'id_rsa', 'id_ecdsa', 'id_ed25519', 'id_dsa', 'auth.json', 'credentials.json', '.credentials.json') -or
+        $Name -like '.env.*' -or $Name -like '*private_key*' -or $Name -like '*.pem' -or $Name -like '*.key')
+}
+
+# Resolve junctions and shared skill links without requiring PowerShell 7 APIs.
+function Resolve-HostSkillPath {
+    param([string]$Path, [int]$Depth = 0)
+    if ($Depth -gt 40) { return '' }
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    if (-not $item -or -not $item.PSIsContainer) { return '' }
+    if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        $target = @($item.Target)[0]
+        if (-not $target) { return '' }
+        if (-not [IO.Path]::IsPathRooted($target)) { $target = Join-Path $item.Parent.FullName $target }
+        return (Resolve-HostSkillPath $target ($Depth + 1))
+    }
+    if (-not $item.Parent) { return $item.FullName }
+    $parent = Resolve-HostSkillPath $item.Parent.FullName ($Depth + 1)
+    if ($parent) { return (Join-Path $parent $item.Name) }
+    return ''
+}
+
+function Get-HostSkills {
+    param([string]$Path, [string[]]$Roots, [string[]]$Ancestors = @())
+    $physical = Resolve-HostSkillPath $Path
+    if (-not $physical -or $physical -in $Ancestors) { return }
+    $allowed = $false
+    foreach ($root in $Roots) {
+        if (($physical + [IO.Path]::DirectorySeparatorChar).StartsWith(
+            $root.TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar,
+            [StringComparison]::OrdinalIgnoreCase)) { $allowed = $true; break }
+    }
+    if (-not $allowed) { return }
+    $marker = Get-Item -LiteralPath (Join-Path $physical 'SKILL.md') -ErrorAction SilentlyContinue
+    if ($marker -and -not $marker.PSIsContainer -and -not ($marker.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        return $physical
+    }
+    foreach ($child in Get-ChildItem -LiteralPath $physical -Directory -ErrorAction SilentlyContinue) {
+        if ($child.Name.StartsWith('.') -or (Test-HostSetupExcluded $child.Name)) { continue }
+        Get-HostSkills $child.FullName $Roots (@($Ancestors) + $physical)
+    }
+}
+
+function Get-HostSetupItems {
+    param([string]$HostDir)
+
+    $configDir = if ($env:XDG_CONFIG_HOME) { $env:XDG_CONFIG_HOME } else { Join-Path $HostDir '.config' }
+    $claudeDir = if ($env:CLAUDE_CONFIG_DIR) { $env:CLAUDE_CONFIG_DIR } else { Join-Path $HostDir '.claude' }
+    $codexDir = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HostDir '.codex' }
+    $hermesDir = if ($env:HERMES_HOME) { $env:HERMES_HOME } else { Join-Path $HostDir '.hermes' }
+    $harnesses = @(
+        @{ Id = 'agents'; Name = 'Shared agents'; Root = (Join-Path $HostDir '.agents'); References = @('AGENTS.md'); Config = @() },
+        @{ Id = 'claude'; Name = 'Claude Code'; Root = $claudeDir; References = @('CLAUDE.md', 'rules', 'agents', 'commands'); Config = @('settings.json') },
+        @{ Id = 'codex'; Name = 'Codex'; Root = $codexDir; References = @('AGENTS.md', 'AGENTS.override.md', 'rules', 'agents', 'prompts'); Config = @('config.toml') },
+        @{ Id = 'cursor'; Name = 'Cursor'; Root = (Join-Path $HostDir '.cursor'); References = @('AGENTS.md', 'rules', 'commands'); Config = @('mcp.json', 'cli-config.json') },
+        @{ Id = 'gemini'; Name = 'Gemini CLI'; Root = (Join-Path $HostDir '.gemini'); References = @('GEMINI.md', 'commands'); Config = @('settings.json') },
+        @{ Id = 'opencode'; Name = 'OpenCode'; Root = (Join-Path $configDir 'opencode'); References = @('AGENTS.md', 'agents', 'commands'); Config = @('opencode.json', 'opencode.jsonc') },
+        @{ Id = 'hermes'; Name = 'Hermes'; Root = $hermesDir; References = @('SOUL.md', 'memories/MEMORY.md', 'memories/USER.md'); Config = @('config.yaml') }
+    )
+    $roots = @($harnesses | ForEach-Object { Resolve-HostSkillPath (Join-Path $_.Root 'skills') } | Where-Object { $_ })
+    foreach ($harness in $harnesses) {
+        if (-not (Test-Path -LiteralPath $harness.Root -PathType Container)) { continue }
+        foreach ($relative in (@('skills') + $harness.References + $harness.Config)) {
+            $source = Join-Path $harness.Root $relative
+            $target = "imports/$($harness.Id)/$relative"
+            $kind = 'reference'
+            $label = "$($harness.Name) / $relative (reference)"
+            if ($relative -eq 'skills') {
+                $skills = @(Get-HostSkills $source $roots)
+                if (-not $skills.Count) { continue }
+                $kind = 'skills'
+                $target = "skills/imported/$($harness.Id)"
+                $label = "$($harness.Name) / Skills ($($skills.Count) found)"
+            }
+            else {
+                $item = Get-Item -LiteralPath $source -Force -ErrorAction SilentlyContinue
+                if (-not $item -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { continue }
+                if ($item.PSIsContainer) {
+                    if (-not (Get-ChildItem -LiteralPath $source -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1)) { continue }
+                }
+                else { $target += '.reference' }
+                if ($relative -in $harness.Config) {
+                    $kind = 'config'
+                    $label = "$($harness.Name) / $relative (config reference; may contain keys)"
+                }
+            }
+            [pscustomobject]@{ Source = $source; Target = $target; Kind = $kind; Label = $label; Roots = $roots }
+        }
+    }
+}
+
+function Select-HostSetup {
+    param([string]$DataDir, [string]$HostDir)
+    $selection = @{ Decision = ''; Items = @() }
+    if ($script:CliNonInteractive -or -not (Test-InteractiveConsole) -or
+        (Test-Path -LiteralPath (Join-Path $DataDir '.a0-install/host-setup-v1'))) { return $selection }
+    $items = @(Get-HostSetupItems $HostDir)
+    if (-not $items.Count) { return $selection }
+    $choice = select_from_menu -Header @"
+Import your existing agent setup?
+Found skills or settings on this computer. The image downloads in the background.
+This is offered once per data directory. You can review before importing.
+"@ -Options @('Choose what to import', 'Skip import')
+    $selection.Decision = 'declined'
+    if ($choice -ne 0) { return $selection }
+    foreach ($item in $items) {
+        if (Get-Item -LiteralPath (Join-Path $DataDir $item.Target) -Force -ErrorAction SilentlyContinue) {
+            $item.Label += ' [already present; kept]'
+        }
+    }
+    $indices = @(select_checkboxes -Header @"
+Choose what to bring into Agent Zero (nothing selected by default).
+Skills become available in usr/skills/imported/<harness>.
+Other files are inactive references in usr/imports/<harness>.
+Config copies may contain credentials. Existing files are kept.
+"@ -Options @($items | ForEach-Object { $_.Label }) `
+        -Details @($items | ForEach-Object { "Source: $($_.Source)`nDestination: /a0/usr/$($_.Target)" }))
+    if (-not $indices.Count) { return $selection }
+    $choice = select_from_menu -Header @"
+Import $($indices.Count) selected group(s) into $DataDir?
+Skills are installed; instructions and config are reference copies only.
+Settings may include inline secrets. No hooks or MCP servers are enabled.
+Credential stores, caches, dependencies and embedded links are excluded.
+"@ -Options @('Import selected items', 'Skip import')
+    if ($choice -eq 0) {
+        $selection.Decision = 'imported'
+        $selection.Items = @($indices | ForEach-Object { $items[$_] })
+    }
+    return $selection
+}
+
+function New-HostSetupParent {
+    param([string]$DataDir, [string]$Relative)
+    $parts = $Relative -split '/'
+    $parent = $DataDir
+    for ($i = 0; $i -lt $parts.Count - 1; $i++) {
+        if ($parts[$i] -in @('.', '..', '')) { throw 'Invalid import destination.' }
+        $parent = Join-Path $parent $parts[$i]
+        $item = Get-Item -LiteralPath $parent -Force -ErrorAction SilentlyContinue
+        if ($item -and ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw "Import destination is a link: $parent" }
+        if (-not $item) { $null = New-Item -ItemType Directory -Path $parent }
+        elseif (-not $item.PSIsContainer) { throw "Import destination is not a directory: $parent" }
+    }
+}
+
+function Copy-HostSetupTree {
+    param([string]$Source, [string]$Target, [string]$Kind)
+    $item = Get-Item -LiteralPath $Source -Force -ErrorAction Stop
+    if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { return }
+    if ($item.PSIsContainer) {
+        $null = New-Item -ItemType Directory -Path $Target
+        foreach ($child in Get-ChildItem -LiteralPath $Source -Force -ErrorAction Stop) {
+            if (Test-HostSetupExcluded $child.Name) { continue }
+            $name = $child.Name
+            if (-not $child.PSIsContainer -and $Kind -ne 'skills') { $name += '.reference' }
+            Copy-HostSetupTree $child.FullName (Join-Path $Target $name) $Kind
+        }
+    }
+    else { [IO.File]::Copy($Source, $Target, $false) }
+}
+
+function Set-HostSetupPrivate {
+    param([string]$Path)
+    if ($env:OS -ne 'Windows_NT') { return }
+    $acl = Get-Acl -LiteralPath $Path
+    $acl.SetAccessRuleProtection($true, $false)
+    $inheritance = [Security.AccessControl.InheritanceFlags]::None
+    if (Test-Path -LiteralPath $Path -PathType Container) {
+        $inheritance = [Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+    }
+    $rule = [Security.AccessControl.FileSystemAccessRule]::new(
+        [Security.Principal.WindowsIdentity]::GetCurrent().User,
+        [Security.AccessControl.FileSystemRights]::FullControl, $inheritance,
+        [Security.AccessControl.PropagationFlags]::None, [Security.AccessControl.AccessControlType]::Allow)
+    $acl.SetAccessRule($rule)
+    Set-Acl -LiteralPath $Path -AclObject $acl
+}
+
+function Import-HostSetup {
+    param([string]$DataDir, [hashtable]$Selection)
+    if (-not $Selection.Decision) { return }
+    New-HostSetupParent $DataDir '.a0-install/host-setup-v1'
+    $seen = @{}
+    foreach ($item in $Selection.Items) {
+        New-HostSetupParent $DataDir $item.Target
+        $target = Join-Path $DataDir $item.Target
+        if (Get-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue) {
+            print_warn "Kept existing import: $($item.Target)"
+            continue
+        }
+        $stage = Join-Path $DataDir ('.a0-install/import.' + [guid]::NewGuid().ToString('N'))
+        $null = New-Item -ItemType Directory -Path $stage
+        $payload = Join-Path $stage 'payload'
+        try {
+            Set-HostSetupPrivate $stage
+            if ($item.Kind -eq 'skills') {
+                $null = New-Item -ItemType Directory -Path $payload
+                foreach ($skill in @(Get-HostSkills $item.Source $item.Roots)) {
+                    if ($seen.ContainsKey($skill)) { continue }
+                    $name = Split-Path -Leaf $skill
+                    $dest = Join-Path $payload $name
+                    if (Test-Path -LiteralPath $dest) { print_warn "Skipped duplicate skill folder name: $name"; continue }
+                    Copy-HostSetupTree $skill $dest skills
+                    $seen[$skill] = $true
+                }
+            }
+            else { Copy-HostSetupTree $item.Source $payload reference }
+            Set-HostSetupPrivate $payload
+            Move-Item -LiteralPath $payload -Destination $target -ErrorAction Stop
+            print_ok "Imported: $($item.Target)"
+        }
+        finally { Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+    $marker = [IO.File]::Open((Join-Path $DataDir '.a0-install/host-setup-v1'), [IO.FileMode]::CreateNew)
+    try {
+        $bytes = [Text.Encoding]::UTF8.GetBytes($Selection.Decision + "`n")
+        $marker.Write($bytes, 0, $bytes.Length)
+    }
+    finally { $marker.Dispose() }
+    if ($Selection.Decision -eq 'imported') {
+        print_info 'Skills are available under /a0/usr/skills/imported. Reference copies are under /a0/usr/imports.'
     }
 }
 
@@ -1848,6 +2182,7 @@ function Convert-ToDockerPath {
 
 # Returns $true on success, $false if user pressed Escape to go back.
 function create_instance {
+    try {
     # -----------------------------------------------------------
     # Gather configuration from user (step-based wizard)
     #   Esc on any step goes back to the previous step.
@@ -1915,6 +2250,7 @@ function create_instance {
         switch ($wizardStep) {
             0 {
                 # Quick Start vs Manual mode selection
+                Stop-ImagePull
                 $modeIndex = select_from_menu `
                     -Header 'How would you like to install Agent Zero?' `
                     -Options @(
@@ -1933,9 +2269,11 @@ function create_instance {
                     $dataDir = Join-Path $instanceDir 'usr'
                     $port = "$defaultPort"
                     New-Item -ItemType Directory -Force -Path $dataDir *> $null
+                    Start-ImagePull $script:SelectedTag
                     $wizardStep = 5
                 }
                 else {
+                    $quickStart = $false
                     $wizardStep = 1
                 }
             }
@@ -1943,6 +2281,7 @@ function create_instance {
             1 {
                 # Tag / version selection (uses its own full-screen menu)
                 if (select_image_tag) {
+                    Start-ImagePull $script:SelectedTag
                     $wizardStep = 2
                 }
                 else {
@@ -2073,11 +2412,11 @@ function create_instance {
 
     $image = "agent0ai/agent-zero:$($script:SelectedTag)"
 
-    print_info 'Pulling Agent Zero image (this may take a moment)...'
-    Invoke-Docker -Arguments @('pull', '--quiet', $image)
-    if ($LASTEXITCODE -ne 0) {
-        throw 'Failed to pull Docker image.'
-    }
+    Start-ImagePull $script:SelectedTag
+    $hostSetup = Select-HostSetup $dataDir $script:HomeDir
+    Complete-ImagePull
+    try { Import-HostSetup $dataDir $hostSetup }
+    catch { print_warn "Some setup files could not be imported. Your originals are unchanged; installation will continue. $_" }
 
     print_info 'Starting Agent Zero...'
     $dataDirDocker = Convert-ToDockerPath -PathValue $dataDir
@@ -2107,6 +2446,8 @@ function create_instance {
     $script:CreatedContainerName = $containerName
 
     return $true
+    }
+    finally { Stop-ImagePull }
 }
 
 function Get-AgentZeroContainerRows {
@@ -2293,7 +2634,7 @@ function manage_single_instance {
             }
             'delete' {
                 Write-Host "Are you sure you want to delete '$ContainerName'? [y/N]: " -NoNewline
-                $confirmKey = [Console]::ReadKey($true)
+                $confirmKey = Read-InstallerKey
                 Write-Host ''
                 if ($confirmKey.KeyChar -eq 'y' -or $confirmKey.KeyChar -eq 'Y') {
                     # Stop first if running

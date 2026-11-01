@@ -192,7 +192,7 @@ restore_tty() {
         stty sane 2>/dev/null </dev/tty || true
     fi
 }
-trap restore_tty EXIT
+trap 'stop_image_pull; cleanup_host_setup; restore_tty' EXIT
 trap 'restore_tty; exit 130' INT
 trap 'restore_tty; exit 143' TERM HUP
 
@@ -565,6 +565,307 @@ select_from_menu() {
             fi
         fi
     done
+}
+
+# Reusable, paged picker; optional CHECKBOX_DETAILS and result CHECKED_INDICES.
+select_checkboxes() {
+    local header="$1"; shift
+    local options=("$@") checked=() cursor=0 i first last rows page_size key next
+    CHECKED_INDICES=()
+    for ((i=0; i<${#options[@]}; i++)); do checked[i]=0; done
+    [ "${#options[@]}" -gt 0 ] || return 0
+    while :; do
+        rows=$(stty size </dev/tty 2>/dev/null) || rows="24 80"
+        rows=${rows%% *}
+        page_size=$((rows - 15))
+        [ "$page_size" -ge 3 ] || page_size=3
+        first=$((cursor / page_size * page_size))
+        last=$((first + page_size))
+        [ "$last" -le "${#options[@]}" ] || last=${#options[@]}
+        clear >/dev/tty 2>&1 || true
+        printf '%s\n\n' "$header" >/dev/tty
+        for ((i=first; i<last; i++)); do
+            local mark=' ' pointer=' '
+            [ "${checked[i]}" -eq 0 ] || mark=x
+            [ "$i" -ne "$cursor" ] || pointer='>'
+            if [ "$i" -eq "$cursor" ]; then
+                printf "${GREEN} %s [%s] %s${NC}\n" "$pointer" "$mark" "${options[i]}" >/dev/tty
+            else
+                printf ' %s [%s] %s\n' "$pointer" "$mark" "${options[i]}" >/dev/tty
+            fi
+        done
+        if [ -n "${CHECKBOX_DETAILS[cursor]-}" ]; then
+            printf '\n%s\n' "${CHECKBOX_DETAILS[cursor]}" >/dev/tty
+        fi
+        printf '\nItems %d-%d of %d\n' "$((first+1))" "$last" "${#options[@]}" >/dev/tty
+        printf '↑/↓ navigate  Space toggle  Enter review  Esc skip\n' >/dev/tty
+        IFS= read -rsn1 key </dev/tty || return 1
+        case "$key" in
+            '')
+                for ((i=0; i<${#options[@]}; i++)); do
+                    [ "${checked[i]}" -eq 0 ] || CHECKED_INDICES+=("$i")
+                done
+                return 0 ;;
+            ' ') checked[cursor]=$((1 - checked[cursor])) ;;
+            $'\x03') return 130 ;;
+            $'\x04'|$'\x7f'|$'\x08') return 1 ;;
+            $'\x1b')
+                read_byte_with_short_timeout || true
+                [ "$_TIMED_KEY" = '[' ] || return 1
+                read_byte_with_short_timeout || true
+                next="$_TIMED_KEY"
+                case "$next" in
+                    A) cursor=$(((cursor + ${#options[@]} - 1) % ${#options[@]})) ;;
+                    B) cursor=$(((cursor + 1) % ${#options[@]})) ;;
+                esac ;;
+        esac
+    done
+}
+
+A0_PULL_PID=""
+A0_PULL_LOG=""
+A0_PULL_IMAGE=""
+stop_image_pull() {
+    if [ -n "$A0_PULL_PID" ]; then
+        kill "$A0_PULL_PID" 2>/dev/null || true
+        wait "$A0_PULL_PID" 2>/dev/null || true
+    fi
+    [ -z "$A0_PULL_LOG" ] || rm -f "$A0_PULL_LOG"
+    A0_PULL_PID="" A0_PULL_LOG="" A0_PULL_IMAGE=""
+}
+
+start_image_pull() {
+    local image="agent0ai/agent-zero:$1"
+    [ "$A0_PULL_IMAGE" != "$image" ] || return 0
+    stop_image_pull
+    A0_PULL_LOG=$(mktemp "${TMPDIR:-/tmp}/a0-pull.XXXXXX") || return 1
+    A0_PULL_IMAGE="$image"
+    "${DOCKER[@]}" pull --quiet "$image" >"$A0_PULL_LOG" 2>&1 </dev/null &
+    A0_PULL_PID=$!
+}
+
+finish_image_pull() {
+    local rc=0
+    print_info 'Waiting for the Agent Zero image download...'
+    wait "$A0_PULL_PID" || rc=$?
+    A0_PULL_PID=""
+    if [ "$rc" -ne 0 ]; then
+        print_error 'Could not download the Agent Zero image.'
+        cat "$A0_PULL_LOG" >&2
+    fi
+    stop_image_pull
+    return "$rc"
+}
+
+A0_IMPORT_STAGE=""
+cleanup_host_setup() {
+    [ -z "$A0_IMPORT_STAGE" ] || rm -rf "$A0_IMPORT_STAGE"
+    A0_IMPORT_STAGE=""
+}
+
+# Only known user-owned locations are scanned; never search projects or caches.
+detect_host_setup() {
+    local host_dir="$1" config_dir="${XDG_CONFIG_HOME:-$1/.config}" i path physical
+    HOST_SETUP_IDS=(agents claude codex cursor gemini opencode hermes)
+    HOST_SETUP_NAMES=('Shared agents' 'Claude Code' 'Codex' 'Cursor' 'Gemini CLI' 'OpenCode' 'Hermes')
+    HOST_SETUP_ROOTS=("$host_dir/.agents" "${CLAUDE_CONFIG_DIR:-$host_dir/.claude}" \
+        "${CODEX_HOME:-$host_dir/.codex}" "$host_dir/.cursor" "$host_dir/.gemini" \
+        "$config_dir/opencode" "${HERMES_HOME:-$host_dir/.hermes}")
+    HOST_SETUP_SOURCES=() HOST_SETUP_TARGETS=() HOST_SETUP_KINDS=() HOST_SETUP_LABELS=()
+    HOST_SKILL_ROOTS=()
+    for path in "${HOST_SETUP_ROOTS[@]}"; do
+        if [ -d "$path/skills" ]; then
+            physical=$(cd "$path/skills" 2>/dev/null && pwd -P) || continue
+            HOST_SKILL_ROOTS+=("$physical")
+        fi
+    done
+    for ((i=0; i<${#HOST_SETUP_ROOTS[@]}; i++)); do
+        [ -d "${HOST_SETUP_ROOTS[i]}" ] || continue
+        add_host_setup_item "$i" skills skills
+        case "${HOST_SETUP_IDS[i]}" in
+            agents) add_host_setup_item "$i" reference AGENTS.md ;;
+            claude)
+                for path in CLAUDE.md rules agents commands; do add_host_setup_item "$i" reference "$path"; done
+                add_host_setup_item "$i" config settings.json ;;
+            codex)
+                for path in AGENTS.md AGENTS.override.md rules agents prompts; do add_host_setup_item "$i" reference "$path"; done
+                add_host_setup_item "$i" config config.toml ;;
+            cursor)
+                for path in AGENTS.md rules commands; do add_host_setup_item "$i" reference "$path"; done
+                for path in mcp.json cli-config.json; do add_host_setup_item "$i" config "$path"; done ;;
+            gemini)
+                for path in GEMINI.md commands; do add_host_setup_item "$i" reference "$path"; done
+                add_host_setup_item "$i" config settings.json ;;
+            opencode)
+                for path in AGENTS.md agents commands; do add_host_setup_item "$i" reference "$path"; done
+                for path in opencode.json opencode.jsonc; do add_host_setup_item "$i" config "$path"; done ;;
+            hermes)
+                for path in SOUL.md memories/MEMORY.md memories/USER.md; do add_host_setup_item "$i" reference "$path"; done
+                add_host_setup_item "$i" config config.yaml ;;
+        esac
+    done
+}
+
+host_setup_excluded() {
+    case "$1" in
+        .git|.svn|.hg|node_modules|.venv|venv|__pycache__|.cache|.env|.env.*|.ssh|.gnupg|id_rsa|id_ecdsa|id_ed25519|id_dsa|auth.json|credentials.json|.credentials.json|*private_key*|*.pem|*.key)
+            return 0 ;;
+    esac
+    return 1
+}
+
+# Resolve shared skill links only within known skill roots; stop cycles.
+find_host_skills() {
+    local path="$1" ancestors="${2-}" physical root allowed=0 child
+    [ -d "$path" ] && [ -r "$path" ] || return 0
+    physical=$(cd "$path" 2>/dev/null && pwd -P) || return 0
+    case "$physical" in *$'\n'*) return 0 ;; esac
+    case "$ancestors" in *$'\n'"$physical"$'\n'*) return 0 ;; esac
+    for root in "${HOST_SKILL_ROOTS[@]}"; do
+        case "$physical/" in "$root/"*) allowed=1; break ;; esac
+    done
+    [ "$allowed" -eq 1 ] || return 0
+    if [ -f "$path/SKILL.md" ] && [ ! -L "$path/SKILL.md" ]; then
+        FOUND_HOST_SKILLS+=("$physical")
+        return 0
+    fi
+    for child in "$path"/*; do
+        host_setup_excluded "${child##*/}" && continue
+        find_host_skills "$child" "$ancestors"$'\n'"$physical"$'\n'
+    done
+}
+
+add_host_setup_item() {
+    local index="$1" kind="$2" relative="$3" source target label
+    source="${HOST_SETUP_ROOTS[index]}/$relative"
+    target="imports/${HOST_SETUP_IDS[index]}/$relative"
+    label="${HOST_SETUP_NAMES[index]} / $relative (reference)"
+    if [ "$kind" = skills ]; then
+        FOUND_HOST_SKILLS=()
+        find_host_skills "$source"
+        [ "${#FOUND_HOST_SKILLS[@]}" -gt 0 ] || return 0
+        target="skills/imported/${HOST_SETUP_IDS[index]}"
+        label="${HOST_SETUP_NAMES[index]} / Skills (${#FOUND_HOST_SKILLS[@]} found)"
+    else
+        [ ! -L "$source" ] && [ -r "$source" ] || return 0
+        if [ -d "$source" ]; then
+            [ -n "$(find "$source" -type f -print -quit 2>/dev/null)" ] || return 0
+        elif [ -f "$source" ]; then
+            target="$target.reference"
+        else
+            return 0
+        fi
+        [ "$kind" != config ] || label="${HOST_SETUP_NAMES[index]} / $relative (config reference; may contain keys)"
+    fi
+    HOST_SETUP_SOURCES+=("$source") HOST_SETUP_TARGETS+=("$target")
+    HOST_SETUP_KINDS+=("$kind") HOST_SETUP_LABELS+=("$label")
+}
+
+choose_host_setup() {
+    local data_dir="$1" host_dir="$2" rc=0 choice header index
+    HOST_SETUP_SELECTED=() HOST_SETUP_DECISION=""
+    [ "$A0_CLI_NON_INTERACTIVE" -eq 0 ] || return 0
+    ( : </dev/tty ) 2>/dev/null || return 0
+    [ ! -e "$data_dir/.a0-install/host-setup-v1" ] || return 0
+    detect_host_setup "$host_dir"
+    [ "${#HOST_SETUP_SOURCES[@]}" -gt 0 ] || return 0
+    header=$'Import your existing agent setup?\nFound skills or settings on this computer. The image downloads in the background.\nThis is offered once per data directory. You can review before importing.'
+    choice=$(select_from_menu "--header=$header" 'Choose what to import' 'Skip import') || rc=$?
+    [ "$rc" -ne 130 ] || return 130
+    HOST_SETUP_DECISION=declined
+    [ "$choice" = 0 ] || return 0
+    CHECKBOX_DETAILS=()
+    for ((index=0; index<${#HOST_SETUP_SOURCES[@]}; index++)); do
+        CHECKBOX_DETAILS+=("Source: ${HOST_SETUP_SOURCES[index]}"$'\n'"Destination: /a0/usr/${HOST_SETUP_TARGETS[index]}")
+        if [ -e "$data_dir/${HOST_SETUP_TARGETS[index]}" ] || [ -L "$data_dir/${HOST_SETUP_TARGETS[index]}" ]; then
+            HOST_SETUP_LABELS[index]="${HOST_SETUP_LABELS[index]} [already present; kept]"
+        fi
+    done
+    header=$'Choose what to bring into Agent Zero (nothing selected by default).\nSkills become available in usr/skills/imported/<harness>.\nOther files are inactive references in usr/imports/<harness>.\nConfig copies may contain credentials. Existing files are kept.'
+    select_checkboxes "$header" "${HOST_SETUP_LABELS[@]}" || rc=$?
+    [ "$rc" -ne 130 ] || return 130
+    [ "$rc" -eq 0 ] && [ "${#CHECKED_INDICES[@]}" -gt 0 ] || return 0
+    HOST_SETUP_SELECTED=("${CHECKED_INDICES[@]}")
+    header="Import ${#HOST_SETUP_SELECTED[@]} selected group(s) into $data_dir?"
+    header="$header"$'\nSkills are installed; instructions and config are reference copies only.\nSettings may include inline secrets. No hooks or MCP servers are enabled.\nCredential stores, caches, dependencies and embedded links are excluded.'
+    rc=0
+    choice=$(select_from_menu "--header=$header" 'Import selected items' 'Skip import') || rc=$?
+    [ "$rc" -ne 130 ] || return 130
+    if [ "$choice" = 0 ]; then HOST_SETUP_DECISION=imported; else HOST_SETUP_SELECTED=(); fi
+}
+
+# Create parents without following destination links out of the data directory.
+host_setup_parent() {
+    local parent="$1" relative="$2" part
+    relative=${relative%/*}
+    while [ -n "$relative" ]; do
+        part=${relative%%/*}
+        [ "$part" != . ] && [ "$part" != .. ] || return 1
+        parent="$parent/$part"
+        [ ! -L "$parent" ] || return 1
+        if [ ! -d "$parent" ]; then mkdir -m 700 "$parent" || return 1; fi
+        if [ "$relative" = "$part" ]; then break; fi
+        relative=${relative#*/}
+    done
+}
+
+copy_host_setup_tree() {
+    local source="$1" target="$2" kind="$3" child name
+    [ ! -L "$source" ] || return 0
+    if [ -d "$source" ]; then
+        mkdir -m 700 "$target" || return 1
+        for child in "$source"/* "$source"/.[!.]* "$source"/..?*; do
+            [ -e "$child" ] || continue
+            name=${child##*/}
+            host_setup_excluded "$name" && continue
+            if [ -f "$child" ] && [ "$kind" != skills ]; then name="$name.reference"; fi
+            copy_host_setup_tree "$child" "$target/$name" "$kind" || return 1
+        done
+    elif [ -f "$source" ]; then
+        cp -p "$source" "$target" && chmod go-rwx "$target" || return 1
+    fi
+}
+
+apply_host_setup() {
+    local data_dir="$1" index source target stage skill seen=$'\n' name rc=0
+    [ -n "$HOST_SETUP_DECISION" ] || return 0
+    host_setup_parent "$data_dir" .a0-install/host-setup-v1 || return 1
+    for index in "${HOST_SETUP_SELECTED[@]}"; do
+        source="${HOST_SETUP_SOURCES[index]}"
+        target="$data_dir/${HOST_SETUP_TARGETS[index]}"
+        host_setup_parent "$data_dir" "${HOST_SETUP_TARGETS[index]}" || return 1
+        if [ -e "$target" ] || [ -L "$target" ]; then
+            print_warn "Kept existing import: ${HOST_SETUP_TARGETS[index]}"
+            continue
+        fi
+        stage=$(mktemp -d "$data_dir/.a0-install/import.XXXXXX") || return 1
+        A0_IMPORT_STAGE="$stage"
+        if [ "${HOST_SETUP_KINDS[index]}" = skills ]; then
+            mkdir -m 700 "$stage/payload" || rc=1
+            FOUND_HOST_SKILLS=()
+            find_host_skills "$source"
+            for skill in "${FOUND_HOST_SKILLS[@]}"; do
+                case "$seen" in *$'\n'"$skill"$'\n'*) continue ;; esac
+                name=${skill##*/}
+                if [ -e "$stage/payload/$name" ]; then
+                    print_warn "Skipped duplicate skill folder name: $name"
+                    continue
+                fi
+                copy_host_setup_tree "$skill" "$stage/payload/$name" skills || { rc=1; break; }
+                seen="$seen$skill"$'\n'
+            done
+        else
+            copy_host_setup_tree "$source" "$stage/payload" reference || rc=1
+        fi
+        if [ "$rc" -eq 0 ]; then mv -n "$stage/payload" "$target" || rc=1; fi
+        cleanup_host_setup
+        [ "$rc" -eq 0 ] || return 1
+        print_ok "Imported: ${HOST_SETUP_TARGETS[index]}"
+    done
+    (umask 077; set -C; printf '%s\n' "$HOST_SETUP_DECISION" >"$data_dir/.a0-install/host-setup-v1") || return 1
+    if [ "$HOST_SETUP_DECISION" = imported ]; then
+        print_info 'Skills are available under /a0/usr/skills/imported. Reference copies are under /a0/usr/imports.'
+    fi
 }
 
 DOCKER_INFO_STATUS=""
@@ -1688,6 +1989,7 @@ create_instance() {
     while [ "$WIZARD_STEP" -ge 0 ] && [ "$WIZARD_STEP" -le 6 ]; do
         case "$WIZARD_STEP" in
             0)  # Quick Start vs Manual mode selection
+                stop_image_pull
                 _rc=0
                 SELECTED_INDEX=$(select_from_menu \
                     "--header=How would you like to install Agent Zero?" \
@@ -1706,14 +2008,17 @@ create_instance() {
                     DATA_DIR="$INSTANCE_DIR/usr"
                     PORT="$DEFAULT_PORT"
                     mkdir -p "$DATA_DIR"
+                    start_image_pull "$SELECTED_TAG" || return 1
                     WIZARD_STEP=5
                 else
+                    QUICK_START=0
                     WIZARD_STEP=1
                 fi
                 ;;
 
             1)  # Tag / version selection (uses its own full-screen menu)
                 if select_image_tag; then
+                    start_image_pull "$SELECTED_TAG" || return 1
                     WIZARD_STEP=2
                 else
                     WIZARD_STEP=0; continue  # Esc — back to mode selection
@@ -1818,8 +2123,14 @@ create_instance() {
 
     local IMAGE="agent0ai/agent-zero:$SELECTED_TAG"
 
-    print_info "Pulling Agent Zero image (this may take a moment)..."
-    "${DOCKER[@]}" pull --quiet "$IMAGE"
+    start_image_pull "$SELECTED_TAG" || return 1
+    _rc=0
+    choose_host_setup "$DATA_DIR" "$HOME" || _rc=$?
+    if [ "$_rc" -eq 130 ]; then exit 130; fi
+    finish_image_pull || return 1
+    if ! apply_host_setup "$DATA_DIR"; then
+        print_warn 'Some setup files could not be imported. Your originals are unchanged; installation will continue.'
+    fi
 
     print_info "Starting Agent Zero..."
     local DOCKER_RUN_ARGS=(
@@ -1833,7 +2144,7 @@ create_instance() {
     if [ -n "$AUTH_LOGIN" ]; then
         DOCKER_RUN_ARGS+=(-e "AUTH_LOGIN=${AUTH_LOGIN}" -e "AUTH_PASSWORD=${AUTH_PASSWORD}")
     fi
-    "${DOCKER[@]}" run "${DOCKER_RUN_ARGS[@]}" "$IMAGE"
+    "${DOCKER[@]}" run "${DOCKER_RUN_ARGS[@]}" "$IMAGE" || return 1
 
     # -----------------------------------------------------------
     # 4. Wait for the service to become ready
